@@ -1,0 +1,6 @@
+# Compiled binary
+llama-switch
+
+# Machine-specific generated files
+vram-cache.json
+config.yaml

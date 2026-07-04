@@ -1,0 +1,22 @@
+[Unit]
+Description=llama-switch — GPU model multiplexer for llama-server
+StartLimitIntervalSec=500
+StartLimitBurst=5
+
+[Service]
+Type=simple
+# Optional: wait for a network interface to come up before starting.
+# Edit the IP to match your deployment, or remove the ExecStartPre line
+# if network availability is not a concern.
+# ExecStartPre=/bin/bash -c 'until ping -c 1 -W 1 <your-ip> >/dev/null 2>&1; do sleep 5; done'
+ExecStart=/path/to/llama-switch serve
+WorkingDirectory=/path/to/llama-switch
+Environment=PATH=/usr/local/bin:/usr/bin:/bin:%h/.local/bin
+Restart=on-failure
+RestartSec=5s
+KillMode=mixed
+TimeoutStartSec=1h
+TimeoutStopSec=30s
+
+[Install]
+WantedBy=default.target
