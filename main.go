@@ -163,15 +163,26 @@ func profile(configPath string) {
 
 		fmt.Printf("[%s] profiling...\n", mc.ID)
 
-		used, err := profileSingle(cfg, configPath, mc, logger)
+		used, gpuVRAM, err := profileSingle(cfg, configPath, mc, logger)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "[%s] FAILED: %v\n", mc.ID, err)
 			continue
 		}
 
-		cache[mc.ID] = CacheEntry{Vram: used, Config: mc.Snapshot(cfg.Backend.CommonArgs)}
+		cache[mc.ID] = CacheEntry{Vram: used, GPUVRAM: gpuVRAM, Config: mc.Snapshot(cfg.Backend.CommonArgs)}
 		_ = SaveVRAMCache(cachePath, cache)
-		fmt.Printf("[%s] %d MB — saved to vram-cache.json\n", mc.ID, used)
+
+		// Build per-GPU display string
+		gpuStr := ""
+		if len(gpuVRAM) > 0 {
+			parts := make([]string, len(gpuVRAM))
+			for i, v := range gpuVRAM {
+				parts[i] = fmt.Sprintf("GPU%d:%dMB", i, v)
+			}
+			gpuStr = " (" + strings.Join(parts, ", ") + ")"
+		}
+
+		fmt.Printf("[%s] %d MB%s — saved to vram-cache.json\n", mc.ID, used, gpuStr)
 		fmt.Println()
 	}
 
@@ -179,12 +190,12 @@ func profile(configPath string) {
 }
 
 // profileSingle loads one model, waits for health, measures VRAM, then unloads.
-func profileSingle(cfg *Config, configPath string, mc *ModelConfig, logger *CondLogger) (int, error) {
+func profileSingle(cfg *Config, configPath string, mc *ModelConfig, logger *CondLogger) (int, []int, error) {
 	bm := NewBackendManager(cfg, configPath, logger)
 
 	before, err := queryVRAM(cfg.Backend.NvidiaSMI)
 	if err != nil {
-		return 0, fmt.Errorf("baseline VRAM query: %w", err)
+		return 0, nil, fmt.Errorf("baseline VRAM query: %w", err)
 	}
 	baselineUsed := before.Used
 
@@ -192,7 +203,7 @@ func profileSingle(cfg *Config, configPath string, mc *ModelConfig, logger *Cond
 	_, err = bm.startBackendLocked(mc)
 	bm.mu.Unlock()
 	if err != nil {
-		return 0, fmt.Errorf("load failed: %w", err)
+		return 0, nil, fmt.Errorf("load failed: %w", err)
 	}
 
 	time.Sleep(3 * time.Second)
@@ -200,16 +211,22 @@ func profileSingle(cfg *Config, configPath string, mc *ModelConfig, logger *Cond
 	after, err := queryVRAM(cfg.Backend.NvidiaSMI)
 	if err != nil {
 		_ = bm.StopModel(mc.ID)
-		return 0, fmt.Errorf("post-load VRAM query: %w", err)
+		return 0, nil, fmt.Errorf("post-load VRAM query: %w", err)
 	}
 
 	used := after.Used - baselineUsed
 	if used < 0 {
 		used = after.Used
 	}
+	gpuVRAM := computePerGPUDelta(before, after)
 
 	_ = bm.StopModel(mc.ID)
-	return used, nil
+
+	if err := validateVRAMMeasurement(mc, used); err != nil {
+		return 0, nil, fmt.Errorf("VRAM measurement rejected: %w", err)
+	}
+
+	return used, gpuVRAM, nil
 }
 
 // ── models ──────────────────────────────────
@@ -230,23 +247,34 @@ func listModels(configPath string) {
 	}
 	sort.Strings(ids)
 
-	fmt.Printf("%-16s  %-30s  %8s  %s\n", "ID", "MODEL", "VRAM_MB", "DEVICES")
-	fmt.Println(strings.Repeat("-", 80))
+	fmt.Printf("%-16s  %-30s  %8s  %-20s  %s\n", "ID", "MODEL", "VRAM_MB", "DEVICES", "PER-GPU (MB)")
+	fmt.Println(strings.Repeat("-", 100))
 
 	for _, id := range ids {
 		mc := cfg.FindModel(id)
 		entry := cache[id]
 		vramStr := "???"
+		perGPUStr := ""
 		if entry.Vram > 0 {
 			snap := mc.Snapshot(cfg.Backend.CommonArgs)
 			if entry.Config.Equal(snap) {
 				vramStr = fmt.Sprintf("%d", entry.Vram)
+				if len(entry.GPUVRAM) > 0 {
+					parts := make([]string, 0, len(entry.GPUVRAM))
+					for i, v := range entry.GPUVRAM {
+						if v > 0 {
+							parts = append(parts, fmt.Sprintf("GPU%d:%d", i, v))
+						}
+					}
+					perGPUStr = strings.Join(parts, ", ")
+				}
 			} else {
 				vramStr = fmt.Sprintf("%d (stale)", entry.Vram)
+				perGPUStr = "(stale)"
 			}
 		}
 		devices := strings.Join(mc.Devices, ",")
-		fmt.Printf("%-16s  %-30s  %8s  %s\n", mc.ID, mc.Model, vramStr, devices)
+		fmt.Printf("%-16s  %-30s  %8s  %-20s  %s\n", mc.ID, mc.Model, vramStr, devices, perGPUStr)
 	}
 }
 

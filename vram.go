@@ -90,9 +90,12 @@ type ModelConfigSnapshot struct {
 
 // CacheEntry stores a measured VRAM value together with the config
 // snapshot that was in effect when the measurement was taken.
+// GPUVRAM holds per-GPU VRAM (MB), indexed by nvidia-smi GPU index.
+// It is empty for legacy cache entries (pre-dating per-GPU profiling).
 type CacheEntry struct {
-	Vram   int                 `json:"vram"`
-	Config ModelConfigSnapshot `json:"config"`
+	Vram    int                 `json:"vram"`
+	GPUVRAM []int               `json:"gpu_vram,omitempty"`
+	Config  ModelConfigSnapshot `json:"config"`
 }
 
 // VRAMCache maps model IDs to their profiled cache entries.
@@ -128,7 +131,7 @@ func SaveVRAMCache(path string, cache VRAMCache) error {
 	return os.WriteFile(path, data, 0644)
 }
 
-// vramEstimate returns the estimated VRAM (MB) for a model from the
+// vramEstimate returns the estimated total VRAM (MB) for a model from the
 // profiled cache. Returns 0 if the model hasn't been profiled or the
 // cached entry is stale (config snapshot doesn't match current config).
 func vramEstimate(cache VRAMCache, mc *ModelConfig, commonArgs []string) int {
@@ -140,7 +143,133 @@ func vramEstimate(cache VRAMCache, mc *ModelConfig, commonArgs []string) int {
 	return 0
 }
 
+// vramEstimatePerGPU returns the estimated per-GPU VRAM (MB) for a model.
+// The returned slice is indexed by nvidia-smi GPU index. Entries for GPUs
+// the model doesn't use are 0. Returns nil if the model hasn't been
+// profiled, the cache is stale, or the cache entry predates per-GPU
+// profiling (no GPUVRAM data).
+func vramEstimatePerGPU(cache VRAMCache, mc *ModelConfig, commonArgs []string) []int {
+	if entry, ok := cache[mc.ID]; ok && entry.Vram > 0 {
+		if entry.Config.Equal(mc.Snapshot(commonArgs)) && len(entry.GPUVRAM) > 0 {
+			return entry.GPUVRAM
+		}
+	}
+	return nil
+}
+
+// vramFitsPerGPU checks whether each GPU the model targets has enough
+// free VRAM for its profiled share. The headroom accounts for
+// OS/display-server/other-app VRAM usage and is applied only to the
+// primary GPU (CUDA0); secondary GPUs have no display output and thus
+// no such overhead. The profiled measurement already includes KV cache
+// and compute buffers (it is taken after the model is healthy).
+// If per-GPU profile data is unavailable, falls back to the aggregate check.
+func vramFitsPerGPU(stats *VRAMStats, mc *ModelConfig, cache VRAMCache, commonArgs []string, headroom int) bool {
+	perGPU := vramEstimatePerGPU(cache, mc, commonArgs)
+	if perGPU == nil {
+		// No per-GPU data: fall back to aggregate check
+		needed := vramEstimate(cache, mc, commonArgs)
+		if needed == 0 {
+			return true // unknown VRAM, proceed optimistically
+		}
+		return stats.Free >= needed+headroom
+	}
+
+	// Map device names (CUDA0, CUDA1, ...) to nvidia-smi GPU indices.
+	// nvidia-smi lists GPUs in index order; CUDA0 = index 0, etc.
+	for _, devName := range mc.Devices {
+		gpuIdx := deviceNameToIndex(devName)
+		if gpuIdx < 0 || gpuIdx >= len(stats.GPUs) {
+			continue // can't map, skip this GPU
+		}
+		needed := 0
+		if gpuIdx < len(perGPU) {
+			needed = perGPU[gpuIdx]
+		}
+		if needed == 0 {
+			continue
+		}
+		// Headroom applies only to the primary GPU (index 0):
+		// secondary GPUs have no display output, so no OS overhead.
+		required := needed
+		if gpuIdx == 0 {
+			required += headroom
+		}
+		if stats.GPUs[gpuIdx].Free < required {
+			return false
+		}
+	}
+	return true
+}
+
+// deviceNameToIndex converts a CUDA device name like "CUDA0" to the
+// nvidia-smi GPU index 0. Returns -1 if the name can't be parsed.
+func deviceNameToIndex(name string) int {
+	if len(name) < 5 || !strings.EqualFold(name[:4], "CUDA") {
+		return -1
+	}
+	n, err := strconv.Atoi(name[4:])
+	if err != nil || n < 0 {
+		return -1
+	}
+	return n
+}
+
+// computePerGPUDelta returns the per-GPU VRAM delta (in MB) between
+// two VRAMStats snapshots. The result is indexed by nvidia-smi GPU
+// index. If before is nil, after.Used per GPU is returned directly.
+func computePerGPUDelta(before, after *VRAMStats) []int {
+	if after == nil || len(after.GPUs) == 0 {
+		return nil
+	}
+	result := make([]int, len(after.GPUs))
+	for i, gpu := range after.GPUs {
+		if before != nil && i < len(before.GPUs) {
+			delta := gpu.Used - before.GPUs[i].Used
+			if delta > 0 {
+				result[i] = delta
+			} else {
+				result[i] = gpu.Used
+			}
+		} else {
+			result[i] = gpu.Used
+		}
+	}
+	return result
+}
+
 // ── Snapshot helpers ─────────────────────────
+
+// modelFileSizeMB returns the size of the model's .gguf file in MB,
+// or 0 if the file can't be stat'd.
+func modelFileSizeMB(mc *ModelConfig) int {
+	path := expand(mc.Path)
+	info, err := os.Stat(path)
+	if err != nil {
+		return 0
+	}
+	return int(info.Size() / (1024 * 1024))
+}
+
+// validateVRAMMeasurement checks whether a profiled VRAM figure is
+// plausible. The measured VRAM must be at least as large as the model
+// file (weights alone exceed that), plus a small floor to catch
+// near-zero measurements from corrupted deltas. Returns nil if the
+// measurement is plausible, or an error explaining why it's rejected.
+func validateVRAMMeasurement(mc *ModelConfig, measuredMB int) error {
+	const minPlausible = 256 // 256 MB floor for any real model
+
+	if measuredMB < minPlausible {
+		return fmt.Errorf("measured %d MB is below %d MB floor — likely a corrupted measurement", measuredMB, minPlausible)
+	}
+
+	fileMB := modelFileSizeMB(mc)
+	if fileMB > 0 && measuredMB < fileMB {
+		return fmt.Errorf("measured %d MB is less than model file size %d MB — model may not have fully loaded", measuredMB, fileMB)
+	}
+
+	return nil
+}
 
 // Snapshot extracts the VRAM-affecting fields from a ModelConfig into
 // a ModelConfigSnapshot suitable for cache invalidation. Includes

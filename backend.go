@@ -185,7 +185,7 @@ func (bm *BackendManager) ensureCapacityLocked(mc *ModelConfig) error {
 		}
 	}
 
-	// 2. VRAM limit: evict LRU until estimated VRAM fits
+	// 2. VRAM limit: evict LRU until estimated VRAM fits on each target GPU
 	needed := vramEstimate(bm.vramCache, mc, bm.cfg.Backend.CommonArgs)
 	if needed > 0 {
 		for {
@@ -193,8 +193,8 @@ func (bm *BackendManager) ensureCapacityLocked(mc *ModelConfig) error {
 			if err != nil {
 				break // can't query VRAM, proceed optimistically
 			}
-			headroom := 2048 // 2 GB safety margin
-			if stats.Free >= needed+headroom {
+			headroom := 1024 // 1 GB safety margin (applied to primary GPU only)
+			if vramFitsPerGPU(stats, mc, bm.vramCache, bm.cfg.Backend.CommonArgs, headroom) {
 				break
 			}
 			if len(bm.backends) == 0 {
@@ -338,6 +338,7 @@ func (bm *BackendManager) startBackendLocked(mc *ModelConfig) (*Backend, error) 
 			after, err := queryVRAM(bm.cfg.Backend.NvidiaSMI)
 
 			var profiledVram int
+			var profiledGPUVRAM []int
 			var profiledValid bool
 			if err == nil && after.Used > 0 {
 				used := after.Used
@@ -347,14 +348,19 @@ func (bm *BackendManager) startBackendLocked(mc *ModelConfig) (*Backend, error) 
 						used = delta
 					}
 				}
-				profiledVram = used
-				profiledValid = true
+				profiledGPUVRAM = computePerGPUDelta(before, after)
+				if verr := validateVRAMMeasurement(mc, used); verr != nil {
+					bm.logger.Printf("%s VRAM measurement rejected: %v (not caching)", b.logPrefix, verr)
+				} else {
+					profiledVram = used
+					profiledValid = true
+				}
 			}
 
 			bm.mu.Lock()
 
 			if profiledValid {
-				bm.vramCache[mc.ID] = CacheEntry{Vram: profiledVram, Config: snap}
+				bm.vramCache[mc.ID] = CacheEntry{Vram: profiledVram, GPUVRAM: profiledGPUVRAM, Config: snap}
 				// Copy cache and save outside the lock (MINOR-5 fix)
 				cacheCopy := make(VRAMCache, len(bm.vramCache))
 				for k, v := range bm.vramCache {

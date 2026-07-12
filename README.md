@@ -27,7 +27,7 @@ Key behaviours:
 - **On-demand loading** — no GPU memory used until a model is requested
 - **LRU eviction** — when a new model won't fit, the least-recently-used one is unloaded
 - **Idle timeout** — models unload automatically after 60 minutes with no requests
-- **Auto-profiling** — VRAM usage is measured on first load and cached for future admission decisions
+- **Per-GPU VRAM admission control** — profiling captures per-GPU VRAM usage; admission checks each GPU individually (see [VRAM profiling](#vram-profiling))
 - **Stdout prefixing** — each backend's log output is prefixed with `[model-id]`
 - **OpenAI-compatible** — works with Open WebUI, opencode, agent frameworks, and anything that speaks the OpenAI Chat Completions API
 
@@ -71,7 +71,7 @@ Key settings:
 # Start the proxy
 ./llama-switch serve
 
-# List configured models and VRAM estimates
+# List configured models and VRAM estimates (includes PER-GPU column)
 ./llama-switch models
 
 # Profile VRAM for all unprofiled models (loads each one at a time)
@@ -133,9 +133,21 @@ journalctl --user -u llama-switch -f
 | `config.go` | Config types, YAML loading, path expansion, argument building |
 | `backend.go` | Backend process lifecycle, port allocation, health checks, LRU eviction, idle sweeper |
 | `proxy.go` | HTTP proxy server, model routing, streaming support, load/unload endpoints |
-| `vram.go` | `nvidia-smi` querying, VRAM cache |
+| `vram.go` | `nvidia-smi` querying, VRAM cache, per-GPU admission control |
 | `logger.go` | Thin stdout logger |
 | `config.example.yaml` | Configuration template |
+
+## VRAM profiling
+
+llama-switch profiles VRAM usage by loading each model, measuring the delta via `nvidia-smi`, and caching the result in `vram-cache.json`. This cache drives admission control: when a model is requested, the proxy checks whether enough VRAM is free before loading it (evicting LRU models if necessary).
+
+**Per-GPU admission control.** Profiling captures VRAM usage per GPU (not just aggregate). The cache file has a `gpu_vram` field — an array of MB values indexed by `nvidia-smi` GPU index. When deciding whether a model fits, `ensureCapacityLocked` checks each GPU the model targets individually: every GPU must have enough free VRAM for the model's profiled share on that GPU.
+
+**Headroom.** A 1024 MB (1 GB) safety margin is applied to the **primary GPU only** (CUDA0 / index 0) to account for OS and display-server VRAM overhead. Secondary GPUs have no display output, so no headroom is added for them.
+
+**Validation.** Profiled VRAM measurements are validated before caching. A measurement is rejected if it is below 256 MB or below the model's `.gguf` file size — both indicate a corrupted or incomplete measurement. This applies to both the `profile` command and auto-profiling during `serve`.
+
+**Fallback.** If per-GPU data is unavailable (e.g. legacy cache entries without `gpu_vram`), admission control falls back to the aggregate VRAM check.
 
 ## License
 
