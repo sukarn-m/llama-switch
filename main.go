@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"sort"
 	"strings"
 	"syscall"
@@ -35,10 +36,17 @@ Commands:
 
 Environment:
   LLAMA_SWITCH_CONFIG   Path to config file (overrides default).
+
+Config path resolution order:
+  1. Positional argument
+  2. $LLAMA_SWITCH_CONFIG
+  3. config.yaml next to the binary
+  4. ~/.config/llama-switch/config.yaml
+  5. ./config.yaml (current directory)
 `
 
 // Version is the current llama-switch version. Bump on feature releases.
-const Version = "0.2.1"
+const Version = "0.2.2"
 
 func main() {
 	if len(os.Args) < 2 {
@@ -70,13 +78,28 @@ func main() {
 }
 
 // parseConfigArg extracts the config path from positional args, falling
-// back to LLAMA_SWITCH_CONFIG env var or ./config.yaml.
+// back to LLAMA_SWITCH_CONFIG env var, the binary's directory, or
+// ~/.config/llama-switch/config.yaml.
 func parseConfigArg(args []string) string {
 	if len(args) > 0 && !strings.HasPrefix(args[0], "-") {
 		return args[0]
 	}
 	if p := os.Getenv("LLAMA_SWITCH_CONFIG"); p != "" {
 		return p
+	}
+	// Check next to the binary
+	if exe, err := os.Executable(); err == nil {
+		p := filepath.Join(filepath.Dir(exe), "config.yaml")
+		if _, err := os.Stat(p); err == nil {
+			return p
+		}
+	}
+	// Check ~/.config/llama-switch/config.yaml
+	if home, err := os.UserHomeDir(); err == nil {
+		p := filepath.Join(home, ".config", "llama-switch", "config.yaml")
+		if _, err := os.Stat(p); err == nil {
+			return p
+		}
 	}
 	return "config.yaml"
 }
