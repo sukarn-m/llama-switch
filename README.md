@@ -28,6 +28,8 @@ Key behaviours:
 - **LRU eviction** — when a new model won't fit, the least-recently-used one is unloaded
 - **Idle timeout** — models unload automatically after 60 minutes with no requests
 - **Per-GPU VRAM admission control** — profiling captures per-GPU VRAM usage; admission checks each GPU individually (see [VRAM profiling](#vram-profiling))
+- **Per-model runtime override** — models can use custom binaries (vLLM, Python servers) with their own args, env, and health endpoints (see [Per-model runtime override](#per-model-runtime-override))
+- **Model handlers** — pluggable response post-processing for models that need it (e.g. Chandra 2 OCR: HTML-to-markdown conversion, Devanagari conjunct fixes) (see [Model handlers](#model-handlers))
 - **Stdout prefixing** — each backend's log output is prefixed with `[model-id]`
 - **OpenAI-compatible** — works with Open WebUI, opencode, agent frameworks, and anything that speaks the OpenAI Chat Completions API
 
@@ -130,12 +132,76 @@ journalctl --user -u llama-switch -f
 | File | Purpose |
 |---|---|
 | `main.go` | CLI entry point (`serve`, `profile`, `models`, `status`) |
-| `config.go` | Config types, YAML loading, path expansion, argument building |
+| `config.go` | Config types, YAML loading, path expansion, argument building, per-model binary/env resolution |
 | `backend.go` | Backend process lifecycle, port allocation, health checks, LRU eviction, idle sweeper |
-| `proxy.go` | HTTP proxy server, model routing, streaming support, load/unload endpoints |
+| `proxy.go` | HTTP proxy server, model routing, streaming support, load/unload endpoints, model handler hook |
+| `chandra_handler.go` | Model handler for Chandra 2 OCR (HTML→markdown, Devanagari fixes, thinking stripping) |
 | `vram.go` | `nvidia-smi` querying, VRAM cache, per-GPU admission control |
 | `logger.go` | Thin stdout logger |
+| `llama_switch_test.go` | Tests for per-model runtime override |
+| `chandra_handler_test.go` | Tests for the Chandra OCR handler |
 | `config.example.yaml` | Configuration template |
+
+## Per-model runtime override
+
+Models can use a different binary than `backend.binary`, with their own arguments, environment, and health endpoint. This allows running non-llama-server backends (vLLM, Python servers, etc.) alongside regular GGUF models, managed through the same VRAM management, LRU eviction, and idle sweeping infrastructure.
+
+Optional `ModelConfig` fields:
+
+| Field | YAML | Purpose | Default |
+|-------|------|---------|---------|
+| `Binary` | `binary` | Per-model binary path | `backend.binary` |
+| `Args` | `args` | Raw args with `{port}` placeholder, bypasses llama-server flags | `BuildArgs()` output |
+| `HealthPath` | `health_path` | Custom health check endpoint | `/health` |
+| `Env` | `env` | Per-model env vars, merged on top of `backend.env` | `backend.env` only |
+
+Example — a Python OCR server:
+
+```yaml
+models:
+  - id: custom-ocr
+    model: custom-ocr
+    binary: "python3"
+    args:
+      - "-m"
+      - "ocr_server"
+      - "--port"
+      - "{port}"
+    health_path: "/health"
+    env:
+      CUDA_VISIBLE_DEVICES: "0"
+```
+
+Existing llama-server models are unchanged — no new fields are required.
+
+## Model handlers
+
+Some models produce output that needs post-processing before it's useful to clients (e.g. a VLM that returns structured HTML instead of plain text). Model handlers intercept the backend response and transform it transparently.
+
+A handler implements the `ModelHandler` interface:
+
+```go
+type ModelHandler interface {
+    MatchesModel(modelID string) bool
+    ProcessResponse(resp *http.Response, isStream bool) ([]byte, error)
+}
+```
+
+When a request targets a model with a registered handler, the proxy forces non-streaming, reads the full response, runs `ProcessResponse()`, and returns the transformed JSON. Models without handlers use the normal streaming proxy path.
+
+### Chandra 2 OCR handler
+
+The included Chandra handler (`chandra_handler.go`) post-processes responses from the [Chandra 2 OCR](https://huggingface.co/datalab-to/chandra-ocr-2) model. Chandra is a Qwen3.5-based VLM that outputs structured HTML with bounding boxes. The handler:
+
+1. Extracts HTML from `content` or `reasoning_content` (handles Qwen3.5 thinking mode)
+2. Strips chain-of-thought leakage
+3. Converts HTML to clean markdown (tables, lists, bold, headers, images)
+4. Fixes known Devanagari conjunct-drop errors (कय→क्रय, केता→क्रेता, etc.)
+5. Strips page headers/footers
+
+Clients send a standard chat completions request with an `image_url` and receive clean markdown in the `content` field — no knowledge of the model's HTML format is required.
+
+**To remove the handler:** delete `chandra_handler.go` and `chandra_handler_test.go`, remove the registration line in `NewModelHandler()`. The generic handler infrastructure in `proxy.go` stays for future use.
 
 ## VRAM profiling
 

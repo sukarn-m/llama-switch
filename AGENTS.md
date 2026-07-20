@@ -21,7 +21,8 @@ Everything lives at the repo root in `package main`. There are no subdirectories
 | `main.go` | CLI entry point (`serve`, `profile`, `models`, `status`, `help`), usage text, graceful shutdown, VRAM profiling loop. `profileSingle` returns `(int, []int, error)` — total VRAM and per-GPU slice. |
 | `config.go` | YAML config types (`Config`, `ServerConfig`, `BackendConfig`, `ModelConfig`), loading, defaults, `~`/`$VAR` path expansion, llama-server argument & env building. |
 | `backend.go` | `Backend` (one llama-server process) and `BackendManager` (lifecycle, port allocation, health checks, LRU eviction, idle sweeper). Core of the system. |
-| `proxy.go` | `ProxyServer` — the client-facing HTTP server. Routing, model extraction from request body, streaming/non-streaming forwarding, hop-by-hop header stripping. |
+| `proxy.go` | `ProxyServer` — the client-facing HTTP server. Routing, model extraction from request body, streaming/non-streaming forwarding, hop-by-hop header stripping. Also contains the model handler hook (`forwardWithHandler`) and `forceNonStream` helper for models that need response post-processing. |
+| `chandra_handler.go` | **Model handler module** for Chandra 2 OCR. Implements the `ModelHandler` interface: intercepts backend responses, extracts HTML from `content`/`reasoning_content`, converts to markdown, fixes Devanagari conjunct errors, strips chain-of-thought. Self-contained — can be removed cleanly (see [Model handlers](#model-handlers)). |
 | `vram.go` | `nvidia-smi` VRAM querying, `VRAMCache` JSON sidecar load/save, per-GPU VRAM estimation and admission control (`vramFitsPerGPU`, `vramEstimatePerGPU`, `computePerGPUDelta`, `deviceNameToIndex`, `modelFileSizeMB`, `validateVRAMMeasurement`). |
 | `logger.go` | `CondLogger` — thin `Printf` wrapper over stdout. |
 | `config.yaml` | **Runtime config (gitignored).** The actual models, paths, GPU topology, and server settings for this deployment. Edit carefully; it is the single source of truth. |
@@ -29,6 +30,7 @@ Everything lives at the repo root in `package main`. There are no subdirectories
 | `llama-switch.service` | systemd user unit for running `serve` as a service. |
 | `go.mod` / `go.sum` | Module `llama-switch`, Go 1.26, single dependency. |
 | `llama-switch` | Compiled binary (checked in). Rebuild with `go build`. |
+| `*_test.go` | Unit and integration tests. Run with `go test ./...`. |
 
 ## Architecture & request flow
 
@@ -50,23 +52,55 @@ Client ──HTTP──▶ ProxyServer (:8080)
                      ├─ else: ensureCapacityLocked
                      │    ├─ enforce MaxModels (evict LRU)
                      │    └─ enforce per-GPU VRAM + 1GB headroom on GPU0 (evict LRU)
-                     ├─ startBackendLocked: alloc port, spawn llama-server,
-                     │    wait for /health 200 (HealthTimeoutSeconds)
+                     ├─ startBackendLocked: alloc port, spawn backend,
+                     │    wait for health 200 (HealthTimeoutSeconds)
                      └─ return *Backend
                                             ▼
-                   forward() → proxy to 127.0.0.1:<backend port>,
-                   stream response back if "stream":true
+                   NewModelHandler(modelID) registered?
+                     ├─ yes → forwardWithHandler: force non-streaming,
+                     │        fetch response, ProcessResponse(), return JSON
+                     └─ no  → forward(): proxy to 127.0.0.1:<port>,
+                              stream response back if "stream":true
 ```
 
-- Each loaded model = one `llama-server` child process on its own port from `backend_port_start`–`backend_port_end`.
+- Each loaded model = one `llama-server` (or custom binary) child process on its own port from `backend_port_start`–`backend_port_end`.
 - Backends are addressed only on loopback (`127.0.0.1`); the public listener binds to the configured `host` (set in `config.yaml`).
 - The idle sweeper goroutine (`idleSweeper`) unloads any backend untouched for `idle_timeout_minutes`, polled every `sweep_interval_seconds`.
+
+## Per-model runtime override
+
+Models can use a different binary than `backend.binary`, with their own arguments, environment, and health endpoint. This allows running non-llama-server backends (e.g. vLLM, Python servers) alongside regular GGUF models. Set these optional fields in a model's config:
+
+| Field | Purpose | Default |
+|-------|---------|---------|
+| `binary` | Per-model binary path (overrides `backend.binary`) | `backend.binary` |
+| `args` | Raw args list with `{port}` placeholder, bypasses llama-server flag construction | `BuildArgs()` output |
+| `health_path` | Custom health check endpoint | `/health` |
+| `env` | Per-model env vars, merged on top of `backend.env` | `backend.env` only |
+
+When `args` is set, `BuildArgs()` uses the raw list directly (with `{port}` replaced by the dynamically assigned port) — no `-m`/`--mmproj`/`-c` flags are generated. When `binary` is set, it's resolved via PATH lookup. The rest of llama-switch (VRAM management, LRU eviction, idle sweeping, proxy forwarding) works unchanged because it's all process-and-HTTP-based.
+
+## Model handlers
+
+A model handler is a Go type implementing the `ModelHandler` interface (`MatchesModel`, `ProcessResponse`). When a request targets a model with a registered handler, `handleProxy` routes through `forwardWithHandler` instead of `forward`: the response is read in full, post-processed by the handler, and returned as a single JSON response. Streaming requests are forced to non-streaming (the handler needs the complete output).
+
+Handlers are registered in `NewModelHandler()` in `chandra_handler.go`. To add a new handler: implement the interface in a new file, add a registration line. To remove a handler: delete its file and the registration line. The generic infrastructure (`ModelHandler` interface, `forwardWithHandler`, `forceNonStream`) stays in `proxy.go` and can be reused by future handlers.
+
+### Chandra 2 OCR handler
+
+The Chandra handler (`chandra_handler.go`) post-processes responses from the Chandra 2 OCR model (a Qwen3.5-based VLM):
+
+1. **Extracts HTML from the correct field** — checks `content` first, falls back to `reasoning_content` (Qwen3.5 thinking mode sometimes routes output there)
+2. **Strips chain-of-thought** — removes any thinking text before the first `<div>` tag
+3. **Converts structured HTML to markdown** — Chandra outputs `<div data-bbox="..." data-label="...">` blocks; the handler converts tables, lists, bold, underline, headers, and image descriptions to clean markdown
+4. **Fixes Devanagari conjunct errors** — Chandra drops the `र` in certain conjuncts (कय→क्रय, केता→क्रेता, विकय→विक्रय, केती→क्रेती)
+5. **Strips page headers/footers** — blocks with `data-label="Page-Header"` or `"Page-Footer"` are omitted
 
 ## Configuration reference (`config.yaml`)
 
 - `server`: `host`, `port`, `backend_port_start/end`, `max_models`, `idle_timeout_minutes`, `health_timeout_seconds`, `sweep_interval_seconds`.
 - `backend`: `binary` (path to `llama-server`), `env` (notably `LD_LIBRARY_PATH` for CUDA libs), `common_args` (flags prepended to every model invocation), `workdir`, `nvidia_smi`.
-- `models`: list of `ModelConfig`. Lookup by `id`, `alias`, or `model` name (`FindModel` matches all three). Each builds its llama-server args via `ModelConfig.BuildArgs`. Supports `mmproj` (multimodal), `tensor_split`, `ctx_checkpoints`, and freeform `extra_args`.
+- `models`: list of `ModelConfig`. Lookup by `id`, `alias`, or `model` name (`FindModel` matches all three). Each builds its llama-server args via `ModelConfig.BuildArgs`. Supports `mmproj` (multimodal), `tensor_split`, `ctx_checkpoints`, and freeform `extra_args`. Optional per-model override fields (`binary`, `args`, `health_path`, `env`) allow running non-llama-server backends — see [Per-model runtime override](#per-model-runtime-override).
 - Path expansion: `~` and `$VAR` are expanded in config values (`expand()`), including colon-separated `LD_LIBRARY_PATH`-style lists.
 
 **Defaults applied when fields are zero/empty:** `backend_port_start=8201`, `backend_port_end=8299`, `max_models=2`, `idle_timeout_minutes=60`, `health_timeout_seconds=180`, `sweep_interval_seconds=15`, `nvidia_smi="nvidia-smi"`.
@@ -112,12 +146,15 @@ journalctl --user -u llama-switch -f
 - **Streaming detection** in `forward()` is a naive string scan for `"stream":true` / `"stream": true`. If you touch request handling, be aware this is intentionally simple and does not fully parse JSON.
 - **Errors during backend start** (port alloc fail, binary missing, health timeout) must release the port and clean up — mirror the cleanup in `startBackendLocked`.
 - **Config is authoritative.** `config.yaml` reflects a real deployment with specific GGUF paths, GPU topology, and a bind address. Treat it as live configuration, not an example template.
-- **No tests currently exist.** If adding code, consider that there is no existing test harness to extend — `go test ./...` will pass trivially today.
+- **Tests exist** in `llama_switch_test.go` (per-model runtime override) and `chandra_handler_test.go` (Chandra OCR handler). Run `go test ./...` to execute all tests; use `-short` to skip integration tests.
 
 ## Common tasks for agents
 
 - **Add a new model:** add an entry under `models:` in `config.yaml`; run `llama-switch profile` so admission control has VRAM estimates.
+- **Add a non-llama-server model:** set `binary`, `args` (with `{port}`), and optionally `health_path`/`env` on the model config. The rest of llama-switch handles it automatically.
 - **Add a new HTTP endpoint:** add a path branch in `ProxyServer.handle` (`proxy.go`) and a `handleXxx` method. Management/model-list endpoints return JSON; proxying goes through `handleProxy` → `forward`.
+- **Add a model handler:** implement the `ModelHandler` interface in a new `*_handler.go` file, register it in `NewModelHandler()` (currently in `chandra_handler.go`). The handler intercepts responses in `forwardWithHandler`.
+- **Remove a model handler:** delete its `*_handler.go` and `*_handler_test.go` files, remove the registration line in `NewModelHandler()`. The generic infrastructure in `proxy.go` can stay.
 - **Change eviction policy:** `ensureCapacityLocked` and `evictLRULocked` in `backend.go`. LRU is based on `Backend.lastReq`, updated via `Touch()` on every proxied request.
 - **Change CLI surface:** `main.go` `switch cmd` block + `usageText`. `parseConfigArg` handles config-path discovery.
 - **Rebuild after edits:** `go build` and replace the `llama-switch` binary; restart the systemd unit if running as a service.

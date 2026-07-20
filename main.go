@@ -37,6 +37,9 @@ Environment:
   LLAMA_SWITCH_CONFIG   Path to config file (overrides default).
 `
 
+// Version is the current llama-switch version. Bump on feature releases.
+const Version = "0.2.1"
+
 func main() {
 	if len(os.Args) < 2 {
 		serve("")
@@ -57,6 +60,8 @@ func main() {
 		status(parseConfigArg(args))
 	case "help", "-h", "--help":
 		fmt.Print(usageText)
+	case "version", "--version", "-v":
+		fmt.Printf("llama-switch %s\n", Version)
 	default:
 		fmt.Fprintf(os.Stderr, "Unknown command: %s\n\n", cmd)
 		fmt.Print(usageText)
@@ -112,7 +117,7 @@ func serve(configPath string) {
 	}()
 
 	addr := fmt.Sprintf("%s:%d", cfg.Server.Host, cfg.Server.Port)
-	logger.Printf("llama-switch listening on %s", addr)
+	logger.Printf("llama-switch v%s listening on %s", Version, addr)
 	logger.Printf("  %d models configured, max %d concurrent",
 		len(cfg.Models), cfg.Server.MaxModels)
 
@@ -142,8 +147,10 @@ func profile(configPath string) {
 	cache := LoadVRAMCache(cachePath)
 
 	if _, err := cfg.Backend.ResolveBinary(); err != nil {
-		fmt.Fprintf(os.Stderr, "backend binary not found: %v\n", err)
-		os.Exit(1)
+		// Backend binary may not be needed if all models have per-model binaries.
+		// Warn but don't fail — individual models will fail at load time if their
+		// binary is missing.
+		fmt.Fprintf(os.Stderr, "warning: backend binary not found: %v (models with per-model binaries will still work)\n", err)
 	}
 
 	fmt.Printf("Profiling VRAM for %d models (one at a time)\n\n", len(cfg.Models))

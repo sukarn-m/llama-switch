@@ -39,17 +39,29 @@ type BackendConfig struct {
 }
 
 type ModelConfig struct {
-	ID             string   `yaml:"id"`
-	Model          string   `yaml:"model"`
-	Path           string   `yaml:"path"`
-	Mmproj         string   `yaml:"mmproj"`
-	Alias          string   `yaml:"alias"`
-	ContextSize    int      `yaml:"context_size"`
-	Parallel       int      `yaml:"parallel"`
-	Devices        []string `yaml:"devices"`
-	TensorSplit    string   `yaml:"tensor_split"`
-	CtxCheckpoints int      `yaml:"ctx_checkpoints"`
-	ExtraArgs      []string `yaml:"extra_args"`
+	ID             string            `yaml:"id"`
+	Model          string            `yaml:"model"`
+	Path           string            `yaml:"path"`
+	Mmproj         string            `yaml:"mmproj"`
+	Alias          string            `yaml:"alias"`
+	ContextSize    int               `yaml:"context_size"`
+	Parallel       int               `yaml:"parallel"`
+	Devices        []string          `yaml:"devices"`
+	TensorSplit    string            `yaml:"tensor_split"`
+	CtxCheckpoints int               `yaml:"ctx_checkpoints"`
+	ExtraArgs      []string          `yaml:"extra_args"`
+
+	// ── Per-model runtime override (for non-llama-server backends) ──
+	// When Binary is set, it overrides backend.binary for this model.
+	// When Args is set, it replaces BuildArgs() output entirely (no
+	// -m/--mmproj/-c/etc flags are generated). The {port} placeholder
+	// in each arg is replaced with the dynamically assigned port.
+	// HealthPath overrides the /health endpoint (default: /health).
+	// Env is merged on top of backend.env for per-model overrides.
+	Binary     string            `yaml:"binary"`
+	Args       []string          `yaml:"args"`
+	HealthPath string            `yaml:"health_path"`
+	Env        map[string]string `yaml:"env"`
 }
 
 // ── Path & env expansion ─────────────────────
@@ -150,6 +162,12 @@ func (c *Config) Validate() error {
 		}
 		seenID[m.ID] = true
 
+		// For llama-server models (no custom binary/args), Path is required.
+		// Custom-binary models may not have a local path.
+		if m.Binary == "" && len(m.Args) == 0 && m.Path == "" {
+			return fmt.Errorf("model %s has empty path (required for llama-server models)", m.ID)
+		}
+
 		if m.Model != "" {
 			if seenModel[m.Model] {
 				return fmt.Errorf("duplicate model display name: %s", m.Model)
@@ -179,9 +197,24 @@ func (c *Config) FindModel(id string) *ModelConfig {
 
 // ── Argument building ────────────────────────
 
-// BuildArgs constructs the llama-server CLI args for this model,
-// combining model-specific flags with the common args from config.
+// BuildArgs constructs the CLI args for launching this model's backend.
+// If m.Args (the "args" YAML field) is set, it is used verbatim (after
+// expansion and {port} substitution), bypassing all llama-server-specific
+// flag construction. Otherwise, llama-server-style args are built from the
+// individual model fields.
 func (m *ModelConfig) BuildArgs(common []string, port int) []string {
+	// Raw args mode: use the args list directly, substituting {port}.
+	if len(m.Args) > 0 {
+		args := make([]string, 0, len(m.Args))
+		for _, a := range m.Args {
+			a = expand(a)
+			a = strings.ReplaceAll(a, "{port}", strconv.Itoa(port))
+			args = append(args, a)
+		}
+		return args
+	}
+
+	// llama-server mode: build args from individual fields.
 	args := []string{"-m", expand(m.Path)}
 
 	if m.Mmproj != "" {
@@ -220,16 +253,46 @@ func (m *ModelConfig) BuildArgs(common []string, port int) []string {
 	return args
 }
 
-// BuildEnv constructs the full environment for the backend process,
-// starting from the current environment and overlaying config env vars.
-func (b *BackendConfig) BuildEnv() []string {
+// ResolveBinary returns the binary path to use for this model. If the
+// model has a per-model Binary override, it is used (with expansion and
+// PATH lookup). Otherwise the backend-level binary is resolved.
+func (m *ModelConfig) ResolveBinary(b *BackendConfig) (string, error) {
+	if m.Binary != "" {
+		bin := expand(m.Binary)
+		if filepath.IsAbs(bin) {
+			return bin, nil
+		}
+		return exec.LookPath(bin)
+	}
+	return b.ResolveBinary()
+}
+
+// HealthEndpoint returns the health check path for this model, defaulting
+// to "/health" if not overridden.
+func (m *ModelConfig) HealthEndpoint() string {
+	if m.HealthPath != "" {
+		return m.HealthPath
+	}
+	return "/health"
+}
+
+// BuildModelEnv constructs the full environment for the backend process,
+// starting from the current environment, overlaying backend-level env
+// vars, and finally overlaying per-model env vars. Per-model env takes
+// precedence over backend env, which takes precedence over the OS env.
+func (m *ModelConfig) BuildModelEnv(b *BackendConfig) []string {
 	envMap := make(map[string]string)
 	for _, e := range os.Environ() {
 		if idx := strings.IndexByte(e, '='); idx >= 0 {
 			envMap[e[:idx]] = e[idx+1:]
 		}
 	}
+	// Backend env (lower priority)
 	for k, v := range b.Env {
+		envMap[k] = expand(v)
+	}
+	// Per-model env (higher priority)
+	for k, v := range m.Env {
 		envMap[k] = expand(v)
 	}
 

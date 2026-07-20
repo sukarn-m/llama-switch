@@ -6,6 +6,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 )
@@ -86,6 +87,10 @@ type ModelConfigSnapshot struct {
 	CtxCheckpoints int      `json:"ctx_checkpoints"`
 	ExtraArgs      []string `json:"extra_args"`
 	CommonArgs     []string `json:"common_args"`
+	// Per-model runtime override fields (affect VRAM when set)
+	Binary string   `json:"binary,omitempty"`
+	Args   []string `json:"args,omitempty"`
+	Env    []string `json:"env,omitempty"`
 }
 
 // CacheEntry stores a measured VRAM value together with the config
@@ -256,6 +261,11 @@ func modelFileSizeMB(mc *ModelConfig) int {
 // file (weights alone exceed that), plus a small floor to catch
 // near-zero measurements from corrupted deltas. Returns nil if the
 // measurement is plausible, or an error explaining why it's rejected.
+//
+// For models using custom binaries (non-llama-server backends where
+// Path may be empty or point to a HuggingFace model ID rather than a
+// local file), the file-size check is skipped — only the minimum floor
+// applies.
 func validateVRAMMeasurement(mc *ModelConfig, measuredMB int) error {
 	const minPlausible = 256 // 256 MB floor for any real model
 
@@ -263,9 +273,13 @@ func validateVRAMMeasurement(mc *ModelConfig, measuredMB int) error {
 		return fmt.Errorf("measured %d MB is below %d MB floor — likely a corrupted measurement", measuredMB, minPlausible)
 	}
 
-	fileMB := modelFileSizeMB(mc)
-	if fileMB > 0 && measuredMB < fileMB {
-		return fmt.Errorf("measured %d MB is less than model file size %d MB — model may not have fully loaded", measuredMB, fileMB)
+	// Only validate against file size for llama-server models (local .gguf file).
+	// Custom-binary models may not have a local Path.
+	if mc.Binary == "" && mc.Path != "" {
+		fileMB := modelFileSizeMB(mc)
+		if fileMB > 0 && measuredMB < fileMB {
+			return fmt.Errorf("measured %d MB is less than model file size %d MB — model may not have fully loaded", measuredMB, fileMB)
+		}
 	}
 
 	return nil
@@ -275,6 +289,13 @@ func validateVRAMMeasurement(mc *ModelConfig, measuredMB int) error {
 // a ModelConfigSnapshot suitable for cache invalidation. Includes
 // backend-level common_args since they affect VRAM too.
 func (m *ModelConfig) Snapshot(commonArgs []string) ModelConfigSnapshot {
+	// Sort env keys for deterministic comparison
+	envKeys := make([]string, 0, len(m.Env))
+	for k := range m.Env {
+		envKeys = append(envKeys, k+"="+expand(m.Env[k]))
+	}
+	sort.Strings(envKeys)
+
 	return ModelConfigSnapshot{
 		Path:           m.Path,
 		Mmproj:         m.Mmproj,
@@ -285,6 +306,9 @@ func (m *ModelConfig) Snapshot(commonArgs []string) ModelConfigSnapshot {
 		CtxCheckpoints: m.CtxCheckpoints,
 		ExtraArgs:      m.ExtraArgs,
 		CommonArgs:     commonArgs,
+		Binary:          m.Binary,
+		Args:            m.Args,
+		Env:             envKeys,
 	}
 }
 
@@ -297,7 +321,8 @@ func (s ModelConfigSnapshot) Equal(other ModelConfigSnapshot) bool {
 		s.ContextSize != other.ContextSize ||
 		s.Parallel != other.Parallel ||
 		s.TensorSplit != other.TensorSplit ||
-		s.CtxCheckpoints != other.CtxCheckpoints {
+		s.CtxCheckpoints != other.CtxCheckpoints ||
+		s.Binary != other.Binary {
 		return false
 	}
 	if !sliceEqual(s.Devices, other.Devices) {
@@ -307,6 +332,12 @@ func (s ModelConfigSnapshot) Equal(other ModelConfigSnapshot) bool {
 		return false
 	}
 	if !sliceEqual(s.CommonArgs, other.CommonArgs) {
+		return false
+	}
+	if !sliceEqual(s.Args, other.Args) {
+		return false
+	}
+	if !sliceEqual(s.Env, other.Env) {
 		return false
 	}
 	return true

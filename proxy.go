@@ -281,6 +281,14 @@ func (ps *ProxyServer) handleProxy(w http.ResponseWriter, r *http.Request) {
 	}
 
 	backend.Touch()
+
+	// Check if this model has a registered handler for response post-processing
+	handler := NewModelHandler(modelID)
+	if handler != nil {
+		ps.forwardWithHandler(w, r, bodyBytes, backend, handler)
+		return
+	}
+
 	ps.forward(w, r, bodyBytes, backend)
 }
 
@@ -358,6 +366,83 @@ func (ps *ProxyServer) forward(w http.ResponseWriter, r *http.Request, bodyBytes
 			break
 		}
 	}
+}
+
+// forwardWithHandler proxies the request to the backend, then passes
+// the response through the model handler for post-processing. The handler
+// reads the full response, transforms it, and returns a modified JSON body.
+// Streaming responses are converted to non-streaming (the handler needs
+// the complete output to process it correctly).
+func (ps *ProxyServer) forwardWithHandler(w http.ResponseWriter, r *http.Request, bodyBytes []byte, backend *Backend, handler ModelHandler) {
+	target := backend.BaseURL() + r.URL.Path
+	if r.URL.RawQuery != "" {
+		target += "?" + r.URL.RawQuery
+	}
+
+	// Force non-streaming by removing "stream":true from the request body.
+	// The handler needs the complete response to process it.
+	modifiedBody := forceNonStream(bodyBytes)
+
+	proxyReq, err := http.NewRequestWithContext(r.Context(), r.Method, target, bytes.NewReader(modifiedBody))
+	if err != nil {
+		http.Error(w, fmt.Sprintf("failed to create request: %v", err), http.StatusInternalServerError)
+		return
+	}
+
+	// Copy headers (except hop-by-hop)
+	for key, values := range r.Header {
+		if isHopByHop(key) {
+			continue
+		}
+		for _, v := range values {
+			proxyReq.Header.Add(key, v)
+		}
+	}
+	proxyReq.Host = r.Host
+	if prior := r.Header.Get("X-Forwarded-For"); prior != "" {
+		proxyReq.Header.Set("X-Forwarded-For", prior+", "+r.RemoteAddr)
+	} else {
+		proxyReq.Header.Set("X-Forwarded-For", r.RemoteAddr)
+	}
+	proxyReq.Header.Set("X-Forwarded-Proto", "http")
+
+	resp, err := ps.client.Do(proxyReq)
+	if err != nil {
+		http.Error(w, fmt.Sprintf("backend request failed: %v", err), http.StatusBadGateway)
+		return
+	}
+	defer resp.Body.Close()
+
+	// Process the response through the handler
+	processed, err := handler.ProcessResponse(resp, false)
+	if err != nil {
+		// On error, fall back to raw forwarding
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(resp.StatusCode)
+		raw, _ := io.ReadAll(resp.Body)
+		w.Write(raw)
+		return
+	}
+
+	// Return the processed response
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusOK)
+	w.Write(processed)
+}
+
+// forceNonStream sets "stream":false in the JSON body so the backend
+// returns a single JSON response instead of SSE chunks.
+func forceNonStream(body []byte) []byte {
+	var data map[string]any
+	if err := json.Unmarshal(body, &data); err != nil {
+		return body
+	}
+	data["stream"] = false
+	out, err := json.Marshal(data)
+	if err != nil {
+		return body
+	}
+	return out
 }
 
 // ── Helpers ──────────────────────────────────

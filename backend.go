@@ -160,11 +160,34 @@ func (bm *BackendManager) EnsureLoaded(modelID string) (*Backend, error) {
 			return nil, err
 		}
 
-		b, err := bm.startBackendLocked(mc)
-		if err != nil {
-			deleteLoading()
+		// Retry loop: if the backend fails to start (e.g. CUDA OOM because
+		// VRAM estimates were stale or absent), evict an LRU backend
+		// and retry, up to len(backends) times.
+		var b *Backend
+		var startErr error
+		for attempt := 0; ; attempt++ {
+			b, startErr = bm.startBackendLocked(mc)
+			if startErr == nil {
+				break
+			}
+			// If other backends are loaded, evict the LRU one and retry.
+			// The error is likely VRAM-related; freeing space may fix it.
+			if len(bm.backends) == 0 || attempt >= len(bm.backends) {
+				deleteLoading()
+				bm.mu.Unlock()
+				return nil, startErr
+			}
+			bm.logger.Printf("load %s failed (attempt %d): %v — evicting LRU to retry",
+				mc.ID, attempt+1, startErr)
+			if err := bm.evictLRULocked(); err != nil {
+				deleteLoading()
+				bm.mu.Unlock()
+				return nil, fmt.Errorf("%w (and no backends left to evict: %v)", startErr, err)
+			}
+			// Give GPU a moment to release VRAM after kill
 			bm.mu.Unlock()
-			return nil, err
+			time.Sleep(1 * time.Second)
+			bm.mu.Lock()
 		}
 
 		deleteLoading()
@@ -246,7 +269,7 @@ func (bm *BackendManager) startBackendLocked(mc *ModelConfig) (*Backend, error) 
 		return nil, err
 	}
 
-	binPath, err := bm.cfg.Backend.ResolveBinary()
+	binPath, err := mc.ResolveBinary(&bm.cfg.Backend)
 	if err != nil {
 		bm.portAlloc.release(port)
 		return nil, fmt.Errorf("backend binary: %w", err)
@@ -254,7 +277,7 @@ func (bm *BackendManager) startBackendLocked(mc *ModelConfig) (*Backend, error) 
 
 	args := mc.BuildArgs(bm.cfg.Backend.CommonArgs, port)
 	cmd := exec.Command(binPath, args...)
-	cmd.Env = bm.cfg.Backend.BuildEnv()
+	cmd.Env = mc.BuildModelEnv(&bm.cfg.Backend)
 
 	if wd := expand(bm.cfg.Backend.Workdir); wd != "" {
 		if abs, err := filepath.Abs(wd); err == nil {
@@ -311,7 +334,7 @@ func (bm *BackendManager) startBackendLocked(mc *ModelConfig) (*Backend, error) 
 	timeout := time.Duration(bm.cfg.Server.HealthTimeoutSeconds) * time.Second
 	bm.mu.Unlock()
 
-	err = bm.waitHealth(b.doneCh, bm.shutdownCh, port, timeout)
+	err = bm.waitHealth(b.doneCh, bm.shutdownCh, port, mc.HealthEndpoint(), timeout)
 
 	bm.mu.Lock()
 
@@ -434,10 +457,10 @@ func (bm *BackendManager) IsLoaded(id string) bool {
 
 // ── Health check ─────────────────────────────
 
-// waitHealth polls the backend's /health endpoint until it responds 200,
+// waitHealth polls the backend's health endpoint until it responds 200,
 // the timeout expires, or shutdownCh is closed. Does not require bm.mu.
-func (bm *BackendManager) waitHealth(doneCh, shutdownCh chan struct{}, port int, timeout time.Duration) error {
-	url := fmt.Sprintf("http://127.0.0.1:%d/health", port)
+func (bm *BackendManager) waitHealth(doneCh, shutdownCh chan struct{}, port int, healthPath string, timeout time.Duration) error {
+	url := fmt.Sprintf("http://127.0.0.1:%d%s", port, healthPath)
 	client := &http.Client{Timeout: 5 * time.Second}
 	deadline := time.Now().Add(timeout)
 
