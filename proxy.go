@@ -230,8 +230,13 @@ func (ps *ProxyServer) handleModelUnload(w http.ResponseWriter, r *http.Request)
 
 	err = ps.bm.StopModel(req.Model)
 	if err != nil {
-		writeJSONError(w, http.StatusInternalServerError,
-			fmt.Sprintf("failed to unload model %s: %v", req.Model, err))
+		if strings.Contains(err.Error(), "active request(s)") {
+			writeJSONError(w, http.StatusConflict,
+				fmt.Sprintf("failed to unload model %s: %v", req.Model, err))
+		} else {
+			writeJSONError(w, http.StatusInternalServerError,
+				fmt.Sprintf("failed to unload model %s: %v", req.Model, err))
+		}
 		return
 	}
 
