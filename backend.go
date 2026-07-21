@@ -511,13 +511,65 @@ func (bm *BackendManager) ensureCapacityLocked(mc *ModelConfig) error {
 		}
 	}
 
-	// 2. VRAM limit: evict LRU until estimated VRAM fits on each target GPU
+	// 2. VRAM limit: evict LRU until estimated VRAM fits on each target GPU.
+	// Account for VRAM that will be consumed by models currently loading
+	// (they haven't hit nvidia-smi yet but will shortly).
 	needed := vramEstimate(bm.vramCache, mc, bm.cfg.Backend.CommonArgs)
 	if needed > 0 {
+		// Compute pending VRAM from loading models so we don't admit
+		// two big models simultaneously.
+		pendingPerGPU := make([]int, 0)
+		for loadID := range bm.loading {
+			lmc := bm.cfg.FindModel(loadID)
+			if lmc == nil {
+				continue
+			}
+			pg := vramEstimatePerGPU(bm.vramCache, lmc, bm.cfg.Backend.CommonArgs)
+			if pg == nil {
+				// No per-GPU data; use aggregate as fallback
+				agg := vramEstimate(bm.vramCache, lmc, bm.cfg.Backend.CommonArgs)
+				if agg > 0 {
+					if len(pendingPerGPU) == 0 {
+						pendingPerGPU = []int{0}
+					}
+					pendingPerGPU[0] += agg
+				}
+				continue
+			}
+			for len(pendingPerGPU) < len(pg) {
+				pendingPerGPU = append(pendingPerGPU, 0)
+			}
+			for i, v := range pg {
+				pendingPerGPU[i] += v
+			}
+		}
 		for {
 			stats, err := queryVRAM(bm.cfg.Backend.NvidiaSMI)
 			if err != nil {
 				break // can't query VRAM, proceed optimistically
+			}
+			// Adjust free VRAM by subtracting pending loads
+			if len(pendingPerGPU) > 0 {
+				adj := *stats
+				adj.GPUs = make([]GPUInfo, len(stats.GPUs))
+				for i, g := range stats.GPUs {
+					pending := 0
+					if i < len(pendingPerGPU) {
+						pending = pendingPerGPU[i]
+					}
+					used := g.Used + pending
+					if used > g.Total {
+						used = g.Total
+					}
+					adj.GPUs[i] = GPUInfo{Total: g.Total, Used: used, Free: g.Total - used}
+				}
+				adj.Used = 0
+				adj.Free = 0
+				for _, g := range adj.GPUs {
+					adj.Used += g.Used
+					adj.Free += g.Free
+				}
+				stats = &adj
 			}
 			headroom := 1024 // 1 GB safety margin (applied to primary GPU only)
 			if vramFitsPerGPU(stats, mc, bm.vramCache, bm.cfg.Backend.CommonArgs, headroom) {
