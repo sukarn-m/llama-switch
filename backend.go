@@ -580,8 +580,14 @@ func (bm *BackendManager) ensureCapacityLocked(mc *ModelConfig) error {
 			if vramFitsPerGPU(stats, mc, bm.vramCache, bm.cfg.Backend.CommonArgs, headroom) {
 				break
 			}
+			if len(bm.backends) == 0 && len(bm.loading) == 0 {
+				break // nothing left to evict and nothing loading; try anyway
+			}
 			if len(bm.backends) == 0 {
-				break // nothing left to evict; try anyway
+				// Can't evict, but a model is loading — its VRAM isn't
+				// reflected in nvidia-smi yet. Return an error so the
+				// caller blocks in the capacity queue until it finishes.
+				return fmt.Errorf("waiting for %d loading model(s) to free VRAM", len(bm.loading))
 			}
 			if err := bm.evictLRULocked(); err != nil {
 				return err
