@@ -194,8 +194,8 @@ func (h *ChandraHandler) processStream(body []byte) ([]byte, error) {
 
 	// Build the response
 	result := map[string]any{
-		"id":      "chandra-processed",
-		"object":  "chat.completion",
+		"id":     "chandra-processed",
+		"object": "chat.completion",
 		"choices": []any{
 			map[string]any{
 				"index":         0,
@@ -275,19 +275,19 @@ var (
 	// Match italic
 	italicRegex = regexp.MustCompile(`<i>(.*?)</i>`)
 	// Match <td> and </td>
-	tdRegex    = regexp.MustCompile(`</?td[^>]*>`)
+	tdRegex = regexp.MustCompile(`</?td[^>]*>`)
 	// Match <tr> and </tr>
 	trOpenRegex  = regexp.MustCompile(`<tr[^>]*>`)
 	trCloseRegex = regexp.MustCompile(`</tr>`)
 	// Match <table> and </table>
 	tableRegex = regexp.MustCompile(`</?table[^>]*>`)
 	// Match <ol>, <ul>, <li>
-	listItemRegex = regexp.MustCompile(`<li[^>]*>`)
+	listItemRegex  = regexp.MustCompile(`<li[^>]*>`)
 	listCloseRegex = regexp.MustCompile(`</li>`)
-	olOpenRegex   = regexp.MustCompile(`<ol[^>]*>`)
-	olCloseRegex  = regexp.MustCompile(`</ol>`)
-	ulOpenRegex   = regexp.MustCompile(`<ul[^>]*>`)
-	ulCloseRegex  = regexp.MustCompile(`</ul>`)
+	olOpenRegex    = regexp.MustCompile(`<ol[^>]*>`)
+	olCloseRegex   = regexp.MustCompile(`</ol>`)
+	ulOpenRegex    = regexp.MustCompile(`<ul[^>]*>`)
+	ulCloseRegex   = regexp.MustCompile(`</ul>`)
 	// Match <img> tags (for image descriptions)
 	imgTagRegex = regexp.MustCompile(`<img\s+alt="([^"]*)"[^>]*/?>`)
 	// Match headers (h1-h6) — Go regexp doesn't support backreferences,

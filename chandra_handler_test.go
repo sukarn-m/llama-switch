@@ -169,14 +169,14 @@ func TestProcessNonStream(t *testing.T) {
 
 	// Simulate a Chandra response with HTML in content
 	response := map[string]any{
-		"id":      "test",
-		"object":  "chat.completion",
+		"id":     "test",
+		"object": "chat.completion",
 		"choices": []any{
 			map[string]any{
 				"index": 0,
 				"message": map[string]any{
-					"role":             "assistant",
-					"content":          `<div data-label="Text"><p>Hello World</p></div>`,
+					"role":              "assistant",
+					"content":           `<div data-label="Text"><p>Hello World</p></div>`,
 					"reasoning_content": "Thinking about the document...",
 				},
 				"finish_reason": "stop",
@@ -224,7 +224,7 @@ func TestProcessNonStreamWithThinking(t *testing.T) {
 			map[string]any{
 				"index": 0,
 				"message": map[string]any{
-					"role": "assistant",
+					"role":    "assistant",
 					"content": "",
 					"reasoning_content": `The user wants me to extract text.
 
@@ -268,7 +268,7 @@ func TestEndToEndChandraHandler(t *testing.T) {
 		"choices": []any{
 			map[string]any{
 				"message": map[string]any{
-					"role": "assistant",
+					"role":    "assistant",
 					"content": `<div data-label="Section-Header"><p>क्रय विक्रय</p></div><div data-label="Text"><p>कय केता विकय</p></div>`,
 				},
 				"finish_reason": "stop",

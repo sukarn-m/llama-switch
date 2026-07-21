@@ -82,6 +82,10 @@ func (ps *ProxyServer) handle(w http.ResponseWriter, r *http.Request) {
 		ps.handleLoaded(w, r)
 		return
 	}
+	if r.URL.Path == "/admin/profile" && r.Method == "POST" {
+		ps.handleAdminProfile(w, r)
+		return
+	}
 	ps.handleProxy(w, r)
 }
 
@@ -98,7 +102,7 @@ func (ps *ProxyServer) handleLoaded(w http.ResponseWriter, r *http.Request) {
 	for _, id := range loaded {
 		displayName := id
 		if mc := ps.cfg.FindModel(id); mc != nil {
-			displayName = mc.Model
+			displayName = mc.Name
 		}
 		data = append(data, map[string]any{
 			"id":     displayName,
@@ -121,7 +125,7 @@ func (ps *ProxyServer) handleV1Models(w http.ResponseWriter, r *http.Request) {
 			statusVal = "loaded"
 		}
 		models = append(models, map[string]any{
-			"id":       m.Model,
+			"id":       m.Name,
 			"object":   "model",
 			"created":  0,
 			"owned_by": "llama-switch",
@@ -144,7 +148,7 @@ func (ps *ProxyServer) handleModels(w http.ResponseWriter, r *http.Request) {
 			statusVal = "loaded"
 		}
 		entry := map[string]any{
-			"id":     m.Model,
+			"id":     m.Name,
 			"path":   expand(m.Path),
 			"status": map[string]any{"value": statusVal},
 		}
@@ -174,6 +178,13 @@ func (ps *ProxyServer) handleModelLoad(w http.ResponseWriter, r *http.Request) {
 
 	if ps.cfg.FindModel(req.Model) == nil {
 		writeJSONError(w, http.StatusBadRequest, "unknown model: "+req.Model)
+		return
+	}
+
+	if ps.bm.IsDraining() {
+		w.Header().Set("Retry-After", "60")
+		writeJSONError(w, http.StatusServiceUnavailable,
+			"service is profiling models, please retry later")
 		return
 	}
 
@@ -237,6 +248,37 @@ func writeJSONError(w http.ResponseWriter, code int, message string) {
 	})
 }
 
+// handleAdminProfile triggers VRAM profiling on the running service.
+// It drains active requests, evicts all backends, profiles each model
+// one at a time, and streams progress as SSE events. The service is
+// unavailable for proxied requests during profiling.
+func (ps *ProxyServer) handleAdminProfile(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "text/event-stream")
+	w.Header().Set("Cache-Control", "no-cache")
+	w.Header().Set("Connection", "keep-alive")
+
+	flusher, ok := w.(http.Flusher)
+	if !ok {
+		writeJSONError(w, http.StatusInternalServerError, "streaming not supported")
+		return
+	}
+
+	force := r.URL.Query().Get("force") == "true"
+
+	progress := func(format string, args ...any) {
+		fmt.Fprintf(w, "data: "+format+"\n\n", args...)
+		flusher.Flush()
+	}
+
+	progress("Profiling VRAM for %d models (one at a time)", len(ps.cfg.Models))
+
+	_, err := ps.bm.ProfileModels(force, progress)
+	if err != nil {
+		progress("Profiling error: %v", err)
+		return
+	}
+}
+
 // ── Core proxy logic ─────────────────────────
 
 func (ps *ProxyServer) handleProxy(w http.ResponseWriter, r *http.Request) {
@@ -272,6 +314,14 @@ func (ps *ProxyServer) handleProxy(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// During profiling/maintenance, reject proxied requests
+	if ps.bm.IsDraining() {
+		w.Header().Set("Retry-After", "60")
+		writeJSONError(w, http.StatusServiceUnavailable,
+			"service is profiling models, please retry later")
+		return
+	}
+
 	backend, err := ps.bm.EnsureLoaded(modelID)
 	if err != nil {
 		w.Header().Set("Retry-After", "30")
@@ -281,6 +331,11 @@ func (ps *ProxyServer) handleProxy(w http.ResponseWriter, r *http.Request) {
 	}
 
 	backend.Touch()
+	backend.InFlightAdd()
+	defer func() {
+		backend.InFlightDone()
+		ps.bm.SignalCapacity()
+	}()
 
 	// Check if this model has a registered handler for response post-processing
 	handler := NewModelHandler(modelID)

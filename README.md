@@ -60,10 +60,13 @@ Key settings:
 | `server.host` / `server.port` | Proxy bind address |
 | `server.max_models` | Max simultaneously loaded models |
 | `server.idle_timeout_minutes` | Auto-unload after this many minutes idle |
+| `server.queue_max_depth` | Max requests queued when eviction blocked (default 64) |
+| `server.queue_timeout_seconds` | Max wait in capacity queue, seconds (default 600) |
+| `server.profile_drain_seconds` | Drain timeout before profiling, seconds (default 60) |
 | `backend.binary` | Path to `llama-server` |
 | `backend.env.LD_LIBRARY_PATH` | CUDA library paths |
 | `models[].id` | Short routing ID (used in logs and internal tracking) |
-| `models[].model` | Display name (what clients see in API responses) |
+| `models[].name` | Display name (what clients see in API responses) |
 | `models[].path` | Path to `.gguf` file |
 | `models[].devices` | Which CUDA devices to use |
 
@@ -79,9 +82,23 @@ Key settings:
 # Profile VRAM for all unprofiled models (loads each one at a time)
 ./llama-switch profile
 
+# Force re-profiling (skip cache)
+./llama-switch profile --force
+
 # Query loaded models on a running server
 curl http://localhost:8080/v1/loaded
 ```
+
+### Remote profiling
+
+If `llama-switch serve` is already running, the `profile` command automatically detects it and delegates profiling to the running service:
+
+```bash
+./llama-switch profile              # auto-detects running service
+./llama-switch profile --force      # force re-profiling (skip cache)
+```
+
+The service drains active requests (up to `profile_drain_seconds`, default 60s), evicts all backends, profiles each model one at a time, and streams progress via SSE. New requests during profiling get `503` with `Retry-After: 60`.
 
 ### Sending requests
 
@@ -95,7 +112,7 @@ curl -X POST http://localhost:8080/v1/chat/completions \
   }'
 ```
 
-The `model` field accepts the display name, the short ID, or the alias. The proxy loads the model on first request (blocking up to `health_timeout_seconds`), then forwards the request.
+The `model` field accepts the display name or the short ID. The proxy loads the model on first request (blocking up to `health_timeout_seconds`), then forwards the request.
 
 ### Explicit load / unload
 
@@ -160,7 +177,7 @@ Example — a Python OCR server:
 ```yaml
 models:
   - id: custom-ocr
-    model: custom-ocr
+    name: custom-ocr
     binary: "python3"
     args:
       - "-m"

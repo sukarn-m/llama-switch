@@ -28,6 +28,9 @@ type ServerConfig struct {
 	IdleTimeoutMinutes   int    `yaml:"idle_timeout_minutes"`
 	HealthTimeoutSeconds int    `yaml:"health_timeout_seconds"`
 	SweepIntervalSeconds int    `yaml:"sweep_interval_seconds"`
+	QueueMaxDepth        int    `yaml:"queue_max_depth"`
+	QueueTimeoutSeconds  int    `yaml:"queue_timeout_seconds"`
+	ProfileDrainSeconds  int    `yaml:"profile_drain_seconds"`
 }
 
 type BackendConfig struct {
@@ -39,17 +42,16 @@ type BackendConfig struct {
 }
 
 type ModelConfig struct {
-	ID             string            `yaml:"id"`
-	Model          string            `yaml:"model"`
-	Path           string            `yaml:"path"`
-	Mmproj         string            `yaml:"mmproj"`
-	Alias          string            `yaml:"alias"`
-	ContextSize    int               `yaml:"context_size"`
-	Parallel       int               `yaml:"parallel"`
-	Devices        []string          `yaml:"devices"`
-	TensorSplit    string            `yaml:"tensor_split"`
-	CtxCheckpoints int               `yaml:"ctx_checkpoints"`
-	ExtraArgs      []string          `yaml:"extra_args"`
+	ID             string   `yaml:"id"`
+	Name           string   `yaml:"name"`
+	Path           string   `yaml:"path"`
+	Mmproj         string   `yaml:"mmproj"`
+	ContextSize    int      `yaml:"context_size"`
+	Parallel       int      `yaml:"parallel"`
+	Devices        []string `yaml:"devices"`
+	TensorSplit    string   `yaml:"tensor_split"`
+	CtxCheckpoints int      `yaml:"ctx_checkpoints"`
+	ExtraArgs      []string `yaml:"extra_args"`
 
 	// ── Per-model runtime override (for non-llama-server backends) ──
 	// When Binary is set, it overrides backend.binary for this model.
@@ -129,6 +131,15 @@ func LoadConfig(path string) (*Config, error) {
 	if cfg.Server.SweepIntervalSeconds == 0 {
 		cfg.Server.SweepIntervalSeconds = 15
 	}
+	if cfg.Server.QueueMaxDepth == 0 {
+		cfg.Server.QueueMaxDepth = 64
+	}
+	if cfg.Server.QueueTimeoutSeconds == 0 {
+		cfg.Server.QueueTimeoutSeconds = 600 // 10 minutes
+	}
+	if cfg.Server.ProfileDrainSeconds == 0 {
+		cfg.Server.ProfileDrainSeconds = 60
+	}
 	if cfg.Backend.NvidiaSMI == "" {
 		cfg.Backend.NvidiaSMI = "nvidia-smi"
 	}
@@ -151,7 +162,6 @@ func (c *Config) Validate() error {
 	}
 	seenID := make(map[string]bool, len(c.Models))
 	seenModel := make(map[string]bool, len(c.Models))
-	seenAlias := make(map[string]bool, len(c.Models))
 	for i := range c.Models {
 		m := &c.Models[i]
 		if m.ID == "" {
@@ -168,27 +178,25 @@ func (c *Config) Validate() error {
 			return fmt.Errorf("model %s has empty path (required for llama-server models)", m.ID)
 		}
 
-		if m.Model != "" {
-			if seenModel[m.Model] {
-				return fmt.Errorf("duplicate model display name: %s", m.Model)
+		if m.Name != "" {
+			if seenModel[m.Name] {
+				return fmt.Errorf("duplicate model display name: %s", m.Name)
 			}
-			seenModel[m.Model] = true
-		}
-		if m.Alias != "" {
-			if seenAlias[m.Alias] {
-				return fmt.Errorf("duplicate model alias: %s", m.Alias)
-			}
-			seenAlias[m.Alias] = true
+			seenModel[m.Name] = true
 		}
 	}
 	return nil
 }
 
-// findModel looks up a model by ID, alias, or display name.
+// FindModel looks up a model by ID (exact match) or by display name
+// (case-insensitive, covering the former alias behavior).
 func (c *Config) FindModel(id string) *ModelConfig {
 	for i := range c.Models {
 		m := &c.Models[i]
-		if m.ID == id || m.Alias == id || m.Model == id {
+		if m.ID == id {
+			return m
+		}
+		if m.Name != "" && strings.EqualFold(m.Name, id) {
 			return m
 		}
 	}
@@ -220,12 +228,10 @@ func (m *ModelConfig) BuildArgs(common []string, port int) []string {
 	if m.Mmproj != "" {
 		args = append(args, "--mmproj", expand(m.Mmproj))
 	}
-	if m.Model != "" {
-		args = append(args, "--alias", m.Model)
+	if m.Name != "" {
+		args = append(args, "--alias", m.Name)
 	}
-	if m.ContextSize != 0 {
-		args = append(args, "-c", strconv.Itoa(m.ContextSize))
-	}
+	args = append(args, "-c", strconv.Itoa(m.ContextSize))
 	if m.Parallel != 0 {
 		args = append(args, "--parallel", strconv.Itoa(m.Parallel))
 	}

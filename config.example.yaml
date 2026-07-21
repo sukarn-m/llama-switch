@@ -11,6 +11,9 @@ server:
   idle_timeout_minutes: 60
   health_timeout_seconds: 180
   sweep_interval_seconds: 15
+  queue_max_depth: 64           # max requests queued when eviction blocked
+  queue_timeout_seconds: 600   # max wait in capacity queue (10 min)
+  profile_drain_seconds: 60    # drain timeout before profiling
 
 backend:
   binary: "~/sources/llama.cpp-cuda/llama-server"
@@ -31,11 +34,10 @@ backend:
 
 models:
   - id: example-model
-    model: Example-Model-1.0
+    name: Example-Model-1.0
     path: "~/models/example-model.gguf"
     mmproj: "~/models/mmproj-F32.gguf"
-    alias: example-model
-    context_size: 0   # 0 = use llama-server/model default
+    context_size: 0   # 0 = let llama-server use the model's default context
     parallel: 2
     devices: ["CUDA0", "CUDA1"]
     tensor_split: "0.85,0.15"

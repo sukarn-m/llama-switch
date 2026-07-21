@@ -1,6 +1,8 @@
 package main
 
 import (
+	"bufio"
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -46,7 +48,7 @@ Config path resolution order:
 `
 
 // Version is the current llama-switch version. Bump on feature releases.
-const Version = "0.2.2"
+const Version = "0.3.0"
 
 func main() {
 	if len(os.Args) < 2 {
@@ -152,9 +154,21 @@ func serve(configPath string) {
 
 // ── profile ─────────────────────────────────
 
+var flagForcedProfile bool
+
 // profile loads each model one at a time, measures VRAM, and saves the
 // results to vram-cache.json. Already-profiled models are skipped.
+// If a running llama-switch service is detected, delegates to it via SSE.
 func profile(configPath string) {
+	// Check for --force flag in remaining args
+	for i, arg := range os.Args {
+		if arg == "--force" || arg == "-force" {
+			flagForcedProfile = true
+			os.Args = append(os.Args[:i], os.Args[i+1:]...)
+			break
+		}
+	}
+
 	cfg, err := LoadConfig(configPath)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "config error: %v\n", err)
@@ -166,97 +180,75 @@ func profile(configPath string) {
 		os.Exit(1)
 	}
 
-	cachePath := vramCachePath(cfg, configPath)
-	cache := LoadVRAMCache(cachePath)
-
 	if _, err := cfg.Backend.ResolveBinary(); err != nil {
-		// Backend binary may not be needed if all models have per-model binaries.
-		// Warn but don't fail — individual models will fail at load time if their
-		// binary is missing.
 		fmt.Fprintf(os.Stderr, "warning: backend binary not found: %v (models with per-model binaries will still work)\n", err)
 	}
 
-	fmt.Printf("Profiling VRAM for %d models (one at a time)\n\n", len(cfg.Models))
-
-	logger := NewLogger()
-
-	for i := range cfg.Models {
-		mc := &cfg.Models[i]
-
-		snap := mc.Snapshot(cfg.Backend.CommonArgs)
-		if entry, ok := cache[mc.ID]; ok && entry.Vram > 0 && entry.Config.Equal(snap) {
-			fmt.Printf("[%s] CACHE HIT — vram-cache.json says %d MB (delete entry to re-profile)\n", mc.ID, entry.Vram)
-			continue
-		} else if ok && !entry.Config.Equal(snap) {
-			fmt.Printf("[%s] config changed since last profile, re-profiling...\n", mc.ID)
-		}
-
-		fmt.Printf("[%s] profiling...\n", mc.ID)
-
-		used, gpuVRAM, err := profileSingle(cfg, configPath, mc, logger)
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "[%s] FAILED: %v\n", mc.ID, err)
-			continue
-		}
-
-		cache[mc.ID] = CacheEntry{Vram: used, GPUVRAM: gpuVRAM, Config: mc.Snapshot(cfg.Backend.CommonArgs)}
-		_ = SaveVRAMCache(cachePath, cache)
-
-		// Build per-GPU display string
-		gpuStr := ""
-		if len(gpuVRAM) > 0 {
-			parts := make([]string, len(gpuVRAM))
-			for i, v := range gpuVRAM {
-				parts[i] = fmt.Sprintf("GPU%d:%dMB", i, v)
-			}
-			gpuStr = " (" + strings.Join(parts, ", ") + ")"
-		}
-
-		fmt.Printf("[%s] %d MB%s — saved to vram-cache.json\n", mc.ID, used, gpuStr)
-		fmt.Println()
+	// If a running service is detected, delegate to it
+	addr := fmt.Sprintf("%s:%d", cfg.Server.Host, cfg.Server.Port)
+	if isServiceRunning(addr) {
+		runRemoteProfile(addr)
+		return
 	}
 
-	fmt.Println("Done. VRAM estimates saved to", cachePath)
-}
-
-// profileSingle loads one model, waits for health, measures VRAM, then unloads.
-func profileSingle(cfg *Config, configPath string, mc *ModelConfig, logger *CondLogger) (int, []int, error) {
+	// Local profiling
+	logger := NewLogger()
 	bm := NewBackendManager(cfg, configPath, logger)
 
-	before, err := queryVRAM(cfg.Backend.NvidiaSMI)
+	progress := func(format string, args ...any) {
+		fmt.Printf(format+"\n", args...)
+	}
+
+	_, err = bm.ProfileModels(flagForcedProfile, progress)
 	if err != nil {
-		return 0, nil, fmt.Errorf("baseline VRAM query: %w", err)
+		fmt.Fprintf(os.Stderr, "profiling error: %v\n", err)
+		os.Exit(1)
 	}
-	baselineUsed := before.Used
+}
 
-	bm.mu.Lock()
-	_, err = bm.startBackendLocked(mc)
-	bm.mu.Unlock()
+// isServiceRunning checks if a llama-switch service is listening on addr.
+func isServiceRunning(addr string) bool {
+	client := &http.Client{Timeout: 2 * time.Second}
+	resp, err := client.Get(fmt.Sprintf("http://%s/health", addr))
 	if err != nil {
-		return 0, nil, fmt.Errorf("load failed: %w", err)
+		return false
+	}
+	resp.Body.Close()
+	return resp.StatusCode == 200
+}
+
+// runRemoteProfile sends a profiling request to a running service and
+// streams SSE progress to stdout.
+func runRemoteProfile(addr string) {
+	fmt.Printf("Detected running llama-switch at %s — requesting remote profile...\n\n", addr)
+
+	url := fmt.Sprintf("http://%s/admin/profile", addr)
+	if flagForcedProfile {
+		url += "?force=true"
 	}
 
-	time.Sleep(3 * time.Second)
-
-	after, err := queryVRAM(cfg.Backend.NvidiaSMI)
+	resp, err := http.Post(url, "application/json", bytes.NewReader(nil))
 	if err != nil {
-		_ = bm.StopModel(mc.ID)
-		return 0, nil, fmt.Errorf("post-load VRAM query: %w", err)
+		fmt.Fprintf(os.Stderr, "failed to request remote profile: %v\n", err)
+		os.Exit(1)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		fmt.Fprintf(os.Stderr, "remote profile failed: %s: %s\n", resp.Status, string(body))
+		os.Exit(1)
 	}
 
-	used := after.Used - baselineUsed
-	if used < 0 {
-		used = after.Used
+	// Stream SSE events to stdout
+	scanner := bufio.NewScanner(resp.Body)
+	scanner.Buffer(make([]byte, 0, 1024*1024), 1024*1024)
+	for scanner.Scan() {
+		line := scanner.Text()
+		if strings.HasPrefix(line, "data: ") {
+			fmt.Println(strings.TrimPrefix(line, "data: "))
+		}
 	}
-	gpuVRAM := computePerGPUDelta(before, after)
-
-	_ = bm.StopModel(mc.ID)
-
-	if err := validateVRAMMeasurement(mc, used); err != nil {
-		return 0, nil, fmt.Errorf("VRAM measurement rejected: %w", err)
-	}
-
-	return used, gpuVRAM, nil
 }
 
 // ── models ──────────────────────────────────
@@ -277,7 +269,7 @@ func listModels(configPath string) {
 	}
 	sort.Strings(ids)
 
-	fmt.Printf("%-16s  %-30s  %8s  %-20s  %s\n", "ID", "MODEL", "VRAM_MB", "DEVICES", "PER-GPU (MB)")
+	fmt.Printf("%-30s  %8s  %8s  %-20s  %s\n", "MODEL", "CONTEXT", "VRAM_MB", "DEVICES", "PER-GPU (MB)")
 	fmt.Println(strings.Repeat("-", 100))
 
 	for _, id := range ids {
@@ -304,7 +296,12 @@ func listModels(configPath string) {
 			}
 		}
 		devices := strings.Join(mc.Devices, ",")
-		fmt.Printf("%-16s  %-30s  %8s  %-20s  %s\n", mc.ID, mc.Model, vramStr, devices, perGPUStr)
+		parallel := mc.Parallel
+		if parallel == 0 {
+			parallel = 1
+		}
+		ctxStr := fmt.Sprintf("%d", mc.ContextSize/parallel)
+		fmt.Printf("%-30s  %8s  %8s  %-20s  %s\n", mc.Name, ctxStr, vramStr, devices, perGPUStr)
 	}
 }
 

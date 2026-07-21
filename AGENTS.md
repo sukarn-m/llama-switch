@@ -43,6 +43,7 @@ Client ──HTTP──▶ ProxyServer (:8080)
                    ├─ POST /models/load     → explicitly load a model {"model":"id"}
                    ├─ POST /models/unload   → explicitly unload {"model":"id"} (Open WebUI "Eject")
                    ├─ GET  /v1/loaded       → legacy: list loaded models only
+                   ├─ POST /admin/profile   → profile VRAM via running service (SSE stream)
                    └─ everything else       → handleProxy
                                             │
                     parse "model" from JSON body
@@ -100,7 +101,7 @@ The Chandra handler (`chandra_handler.go`) post-processes responses from the Cha
 
 - `server`: `host`, `port`, `backend_port_start/end`, `max_models`, `idle_timeout_minutes`, `health_timeout_seconds`, `sweep_interval_seconds`.
 - `backend`: `binary` (path to `llama-server`), `env` (notably `LD_LIBRARY_PATH` for CUDA libs), `common_args` (flags prepended to every model invocation), `workdir`, `nvidia_smi`.
-- `models`: list of `ModelConfig`. Lookup by `id`, `alias`, or `model` name (`FindModel` matches all three). Each builds its llama-server args via `ModelConfig.BuildArgs`. Supports `mmproj` (multimodal), `tensor_split`, `ctx_checkpoints`, and freeform `extra_args`. Optional per-model override fields (`binary`, `args`, `health_path`, `env`) allow running non-llama-server backends — see [Per-model runtime override](#per-model-runtime-override).
+- `models`: list of `ModelConfig`. Lookup by `id` or `name` (`FindModel` matches `id` exactly, `name` case-insensitively). Each builds its llama-server args via `ModelConfig.BuildArgs`. Supports `mmproj` (multimodal), `tensor_split`, `ctx_checkpoints`, and freeform `extra_args`. Optional per-model override fields (`binary`, `args`, `health_path`, `env`) allow running non-llama-server backends — see [Per-model runtime override](#per-model-runtime-override).
 - Path expansion: `~` and `$VAR` are expanded in config values (`expand()`), including colon-separated `LD_LIBRARY_PATH`-style lists.
 
 **Defaults applied when fields are zero/empty:** `backend_port_start=8201`, `backend_port_end=8299`, `max_models=2`, `idle_timeout_minutes=60`, `health_timeout_seconds=180`, `sweep_interval_seconds=15`, `nvidia_smi="nvidia-smi"`.
@@ -168,3 +169,9 @@ journalctl --user -u llama-switch -f
 - `waitHealth` polls every 2 s; large models may take close to `health_timeout_seconds` (default 180 s) to become ready. The proxy returns `503` with `Retry-After: 30` if a model fails to load.
 - `nvidia-smi` is required for VRAM-aware scheduling; if it is unavailable, `ensureCapacityLocked` falls through optimistically (loads without VRAM checks) — keep this fallback intact.
 - `config.yaml` contains absolute paths specific to the deployment machine; don't generalize them.
+- In-flight request tracking: each `Backend` has an atomic `inFlight` counter, incremented in `handleProxy` before forwarding and decremented via `defer`. Eviction (`evictLRULocked`), idle sweeping (`sweepIdle`), and explicit unload (`StopModel`) all skip backends with `InFlight() > 0` to avoid killing active requests.
+- Capacity queue: when `EnsureLoaded` can't evict (all backends in-flight), the caller releases the write lock and blocks on a channel (`capCh`) until a request completes and calls `SignalCapacity()`, or until the queue timeout (default 600s / 10 min). Requests for already-loaded models hit the fast path and never wait. Max queue depth is `queue_max_depth` (default 64); beyond that, new requests get an error. The queue is best-effort FIFO (goroutine scheduling order, not guaranteed).
+- Drain mode: `BackendManager.StartDraining()` sets an atomic flag that causes `EnsureLoaded` and `handleProxy` to return 503. Used during remote profiling. `WaitIdle(timeout)` blocks until all in-flight counters reach zero.
+- Remote profiling: `POST /admin/profile` (or `?force=true`) triggers profiling on the running service. The CLI `profile` command auto-detects a running service and delegates to this endpoint, streaming SSE output to stdout. Concurrent profiling requests are rejected.
+- The `loading` map registration in `EnsureLoaded` happens AFTER the capacity wait loop, not before. If it were registered first, `len(loading)` would count against `MaxModels` in `ensureCapacityLocked`, causing a deadlock when two goroutines wait for different models simultaneously.
+- `ensureCapacityLocked` adds +1 to `len(backends)+len(loading)` to account for the model being loaded (which hasn't been registered in `loading` yet).

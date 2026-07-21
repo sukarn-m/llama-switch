@@ -4,11 +4,14 @@ import (
 	"bufio"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -21,22 +24,37 @@ type Backend struct {
 	doneCh    chan struct{}
 	mu        sync.Mutex
 	lastReq   time.Time
+	inFlight  int64 // atomic; number of active proxied requests
 }
+
+// InFlightAdd increments the in-flight request counter.
+func (b *Backend) InFlightAdd() { atomic.AddInt64(&b.inFlight, 1) }
+
+// InFlightDone decrements the in-flight request counter.
+func (b *Backend) InFlightDone() { atomic.AddInt64(&b.inFlight, -1) }
+
+// InFlight returns the current in-flight request count.
+func (b *Backend) InFlight() int64 { return atomic.LoadInt64(&b.inFlight) }
 
 // BackendManager manages all backend processes: lifecycle, health, and routing.
 type BackendManager struct {
-	cfg         *Config
-	configPath  string
-	vramCache   VRAMCache
-	vramCacheP  string
-	backends    map[string]*Backend   // keyed by canonical model ID
-	loading     map[string]*sync.Cond // model ID -> condition variable for in-progress loads
-	mu          sync.RWMutex
-	portAlloc   portAllocator
-	logger      *CondLogger
-	sweeperStop chan struct{}
-	sweeperOnce sync.Once
-	shutdownCh  chan struct{} // closed when Stop() is called, aborts waitHealth
+	cfg             *Config
+	configPath      string
+	vramCache       VRAMCache
+	vramCacheP      string
+	backends        map[string]*Backend   // keyed by canonical model ID
+	loading         map[string]*sync.Cond // model ID -> condition variable for in-progress loads
+	mu              sync.RWMutex
+	portAlloc       portAllocator
+	logger          *CondLogger
+	sweeperStop     chan struct{}
+	sweeperOnce     sync.Once
+	shutdownCh      chan struct{} // closed when Stop() is called, aborts waitHealth
+	capCh           chan struct{} // closed+recreated to signal capacity queue waiters
+	queueDepth      int64         // atomic; number of goroutines waiting in the capacity queue
+	draining        atomic.Bool   // when true, reject new load requests
+	profiling       atomic.Bool   // when true, profiling is in progress (prevents concurrent profiling)
+	skipAutoProfile atomic.Bool   // when true, startBackendLocked skips auto-profiling
 }
 
 type portAllocator struct {
@@ -53,13 +71,21 @@ func newPortAllocator(start, end int) portAllocator {
 	}
 }
 
-// alloc returns a free port from the range. Caller must hold bm.mu.
+// alloc returns a free port from the range. It probes each candidate by
+// attempting a TCP bind; ports already in use by other processes (e.g. a
+// running llama-switch service) are skipped. Caller must hold bm.mu.
 func (pa *portAllocator) alloc() (int, error) {
 	for p := pa.start; p <= pa.end; p++ {
-		if !pa.used[p] {
-			pa.used[p] = true
-			return p, nil
+		if pa.used[p] {
+			continue
 		}
+		ln, err := net.Listen("tcp", fmt.Sprintf("127.0.0.1:%d", p))
+		if err != nil {
+			continue // port in use by another process
+		}
+		ln.Close()
+		pa.used[p] = true
+		return p, nil
 	}
 	return 0, fmt.Errorf("no free ports in range %d-%d", pa.start, pa.end)
 }
@@ -84,6 +110,7 @@ func NewBackendManager(cfg *Config, configPath string, logger *CondLogger) *Back
 	}
 	bm.vramCacheP = vramCachePath(cfg, configPath)
 	bm.vramCache = LoadVRAMCache(bm.vramCacheP)
+	bm.capCh = make(chan struct{})
 	return bm
 }
 
@@ -101,6 +128,222 @@ func (bm *BackendManager) Stop() {
 	for id, b := range bm.backends {
 		bm.stopLocked(id, b)
 	}
+}
+
+// ── Capacity queue ──────────────────────────
+
+// signalCapacityLocked closes and recreates the capacity signal channel.
+// This wakes all goroutines waiting in the capacity queue so they can
+// re-check whether capacity is now available.
+// Caller must hold bm.mu.
+func (bm *BackendManager) signalCapacityLocked() {
+	close(bm.capCh)
+	bm.capCh = make(chan struct{})
+}
+
+// SignalCapacity wakes goroutines waiting in the capacity queue.
+// Called after a request completes (InFlightDone) or after a backend
+// is stopped. Safe to call without holding bm.mu.
+func (bm *BackendManager) SignalCapacity() {
+	bm.mu.Lock()
+	bm.signalCapacityLocked()
+	bm.mu.Unlock()
+}
+
+// ── Drain mode ───────────────────────────────
+
+// StartDraining enters drain mode. New backend loads are rejected.
+// Existing in-flight requests are allowed to complete.
+func (bm *BackendManager) StartDraining() { bm.draining.Store(true) }
+
+// StopDraining exits drain mode. Normal operation resumes.
+func (bm *BackendManager) StopDraining() { bm.draining.Store(false) }
+
+// IsDraining returns whether the manager is in drain mode.
+func (bm *BackendManager) IsDraining() bool { return bm.draining.Load() }
+
+// ── Idle waiting ────────────────────────────
+
+// WaitIdle blocks until all backends have zero in-flight requests,
+// or the timeout expires. Returns nil if idle, error on timeout.
+func (bm *BackendManager) WaitIdle(timeout time.Duration) error {
+	deadline := time.Now().Add(timeout)
+	ticker := time.NewTicker(50 * time.Millisecond)
+	defer ticker.Stop()
+
+	for {
+		bm.mu.RLock()
+		busy := false
+		count := len(bm.backends)
+		for _, b := range bm.backends {
+			if b.InFlight() > 0 {
+				busy = true
+				break
+			}
+		}
+		bm.mu.RUnlock()
+
+		if !busy {
+			return nil
+		}
+		if time.Now().After(deadline) {
+			return fmt.Errorf("timed out waiting for %d backends to become idle", count)
+		}
+		<-ticker.C
+	}
+}
+
+// ── Bulk eviction ────────────────────────────
+
+// evictAllLocked stops all backends unconditionally. Caller must hold bm.mu.
+// Use only after WaitIdle confirms no active requests.
+func (bm *BackendManager) evictAllLocked() {
+	for id, b := range bm.backends {
+		bm.stopLocked(id, b)
+	}
+}
+
+// ── Profiling ────────────────────────────────
+
+// ProfileProgress is a callback for profiling progress updates.
+type ProfileProgress func(format string, args ...any)
+
+// ProfileResult holds the outcome of profiling a single model.
+type ProfileResult struct {
+	ModelID string
+	Vram    int
+	GPUVRAM []int
+	Err     error
+	Cached  bool
+}
+
+// ProfileModels profiles each model one at a time. It drains active
+// requests, evicts all backends, then loads/measures/unloads each model.
+// The progress callback is called for each step. If a model has a valid
+// cache entry, it is skipped (Cached=true) unless force is true.
+func (bm *BackendManager) ProfileModels(force bool, progress ProfileProgress) ([]ProfileResult, error) {
+	results := make([]ProfileResult, 0, len(bm.cfg.Models))
+
+	// Prevent concurrent profiling
+	if !bm.profiling.CompareAndSwap(false, true) {
+		return nil, fmt.Errorf("profiling already in progress")
+	}
+	defer bm.profiling.Store(false)
+
+	// Enter drain mode: reject new requests
+	bm.StartDraining()
+	defer bm.StopDraining()
+
+	// Wait for active requests to finish
+	progress("Draining active requests...")
+	drainTimeout := time.Duration(bm.cfg.Server.ProfileDrainSeconds) * time.Second
+	if err := bm.WaitIdle(drainTimeout); err != nil {
+		progress("Drain timeout — force-evicting (%v)", err)
+	}
+
+	// Evict all backends
+	bm.mu.Lock()
+	bm.evictAllLocked()
+	bm.mu.Unlock()
+	progress("All backends evicted. Starting profiling...")
+
+	// Copy cache under lock to avoid data race with startBackendLocked
+	bm.mu.RLock()
+	cache := make(VRAMCache, len(bm.vramCache))
+	for k, v := range bm.vramCache {
+		cache[k] = v
+	}
+	bm.mu.RUnlock()
+
+	// Profile each model
+	for i := range bm.cfg.Models {
+		mc := &bm.cfg.Models[i]
+
+		snap := mc.Snapshot(bm.cfg.Backend.CommonArgs)
+		if !force {
+			if entry, ok := cache[mc.ID]; ok && entry.Vram > 0 && entry.Config.Equal(snap) {
+				progress("[%s] CACHE HIT — %d MB (delete entry to re-profile)", mc.ID, entry.Vram)
+				results = append(results, ProfileResult{
+					ModelID: mc.ID, Vram: entry.Vram, GPUVRAM: entry.GPUVRAM, Cached: true,
+				})
+				continue
+			}
+		}
+
+		progress("[%s] profiling...", mc.ID)
+
+		used, gpuVRAM, err := bm.profileSingleModel(mc)
+		if err != nil {
+			progress("[%s] FAILED: %v", mc.ID, err)
+			results = append(results, ProfileResult{ModelID: mc.ID, Err: err})
+			continue
+		}
+
+		cache[mc.ID] = CacheEntry{Vram: used, GPUVRAM: gpuVRAM, Config: snap}
+
+		// Write cache back under lock
+		bm.mu.Lock()
+		bm.vramCache = cache
+		bm.mu.Unlock()
+		_ = SaveVRAMCache(bm.vramCacheP, cache)
+
+		gpuStr := ""
+		if len(gpuVRAM) > 0 {
+			parts := make([]string, len(gpuVRAM))
+			for gi, v := range gpuVRAM {
+				parts[gi] = fmt.Sprintf("GPU%d:%dMB", gi, v)
+			}
+			gpuStr = " (" + strings.Join(parts, ", ") + ")"
+		}
+		progress("[%s] %d MB%s — saved", mc.ID, used, gpuStr)
+		results = append(results, ProfileResult{
+			ModelID: mc.ID, Vram: used, GPUVRAM: gpuVRAM,
+		})
+	}
+
+	progress("Done. VRAM estimates saved to %s", bm.vramCacheP)
+	return results, nil
+}
+
+// profileSingleModel loads one model, measures VRAM, then unloads.
+func (bm *BackendManager) profileSingleModel(mc *ModelConfig) (int, []int, error) {
+	before, err := queryVRAM(bm.cfg.Backend.NvidiaSMI)
+	if err != nil {
+		return 0, nil, fmt.Errorf("baseline VRAM query: %w", err)
+	}
+	baselineUsed := before.Used
+
+	// Suppress auto-profiling during explicit measurement
+	bm.skipAutoProfile.Store(true)
+	defer bm.skipAutoProfile.Store(false)
+	bm.mu.Lock()
+	_, err = bm.startBackendLocked(mc)
+	bm.mu.Unlock()
+	if err != nil {
+		return 0, nil, fmt.Errorf("load failed: %w", err)
+	}
+
+	time.Sleep(3 * time.Second)
+
+	after, err := queryVRAM(bm.cfg.Backend.NvidiaSMI)
+	if err != nil {
+		_ = bm.StopModel(mc.ID)
+		return 0, nil, fmt.Errorf("post-load VRAM query: %w", err)
+	}
+
+	used := after.Used - baselineUsed
+	if used < 0 {
+		used = after.Used
+	}
+	gpuVRAM := computePerGPUDelta(before, after)
+
+	_ = bm.StopModel(mc.ID)
+
+	if verr := validateVRAMMeasurement(mc, used); verr != nil {
+		return 0, nil, verr
+	}
+
+	return used, gpuVRAM, nil
 }
 
 // ── Backend lifecycle ────────────────────────
@@ -145,19 +388,77 @@ func (bm *BackendManager) EnsureLoaded(modelID string) (*Backend, error) {
 			return b, nil
 		}
 
-		// Register as loading so concurrent requests for the same model wait
+		// Reject new loads during drain mode (profiling, maintenance)
+		if bm.IsDraining() {
+			bm.mu.Unlock()
+			return nil, fmt.Errorf("service is draining (profiling or maintenance in progress)")
+		}
+
+		// Wait for capacity: if we can't evict right now (all backends
+		// in-flight), block on capCh until a request completes and frees
+		// capacity. Already-loaded-model requests hit the fast path
+		// above and never reach here.
+		//
+		// IMPORTANT: the loading map registration happens AFTER this
+		// wait, not before. If we registered first, len(loading) would
+		// count against MaxModels in ensureCapacityLocked, causing a
+		// deadlock when two goroutines wait for different models
+		// simultaneously (both count each other's loading entry).
+		queueTimeout := time.Duration(bm.cfg.Server.QueueTimeoutSeconds) * time.Second
+		deadline := time.Now().Add(queueTimeout)
+
+		for {
+			// Check queue depth limit
+			currentDepth := atomic.LoadInt64(&bm.queueDepth)
+			if int(currentDepth) >= bm.cfg.Server.QueueMaxDepth {
+				bm.mu.Unlock()
+				return nil, fmt.Errorf("queue full (%d pending requests)", currentDepth)
+			}
+
+			err := bm.ensureCapacityLocked(mc)
+			if err == nil {
+				break // capacity available
+			}
+
+			if time.Now().After(deadline) {
+				bm.mu.Unlock()
+				return nil, fmt.Errorf("queue timeout after %v waiting for capacity: %w", queueTimeout, err)
+			}
+
+			// Increment queue depth, snapshot channel, release lock, wait
+			atomic.AddInt64(&bm.queueDepth, 1)
+			capCh := bm.capCh
+			bm.mu.Unlock()
+
+			select {
+			case <-capCh:
+			case <-time.After(time.Until(deadline)):
+			}
+
+			atomic.AddInt64(&bm.queueDepth, -1)
+			bm.mu.Lock()
+
+			// Re-check fast path: another goroutine may have loaded
+			// this model while we were waiting for capacity.
+			if b, ok := bm.backends[canonicalID]; ok {
+				bm.mu.Unlock()
+				return b, nil
+			}
+
+			// Re-check drain mode after waking
+			if bm.IsDraining() {
+				bm.mu.Unlock()
+				return nil, fmt.Errorf("service is draining (profiling or maintenance in progress)")
+			}
+		}
+
+		// Now register as loading so concurrent requests for the same
+		// model wait on loadCond instead of trying to load it again.
 		loadCond := sync.NewCond(&bm.mu)
 		bm.loading[canonicalID] = loadCond
 		deleteLoading := func() {
 			delete(bm.loading, canonicalID)
 			loadCond.Broadcast()
-		}
-
-		// Check if we need to evict to make room (count loading entries too)
-		if err := bm.ensureCapacityLocked(mc); err != nil {
-			deleteLoading()
-			bm.mu.Unlock()
-			return nil, err
 		}
 
 		// Retry loop: if the backend fails to start (e.g. CUDA OOM because
@@ -201,8 +502,10 @@ func (bm *BackendManager) EnsureLoaded(modelID string) (*Backend, error) {
 // toward the MaxModels budget to prevent soft limit violations.
 // Caller must hold bm.mu.
 func (bm *BackendManager) ensureCapacityLocked(mc *ModelConfig) error {
-	// 1. Count limit: evict if loaded + loading would exceed MaxModels
-	for len(bm.backends)+len(bm.loading) > bm.cfg.Server.MaxModels {
+	// 1. Count limit: evict if loaded + loading would exceed MaxModels.
+	// Note: the caller hasn't registered in loading yet (it's done after
+	// capacity is secured), so we add 1 to account for the model being loaded.
+	for len(bm.backends)+len(bm.loading)+1 > bm.cfg.Server.MaxModels {
 		if err := bm.evictLRULocked(); err != nil {
 			return fmt.Errorf("cannot make room for %s: %w", mc.ID, err)
 		}
@@ -236,22 +539,25 @@ func (bm *BackendManager) ensureCapacityLocked(mc *ModelConfig) error {
 	return nil
 }
 
-// evictLRULocked unloads the least-recently-used backend.
+// evictLRULocked unloads the least-recently-used backend that has no
+// active requests. If all backends are busy, returns an error.
 // Caller must hold bm.mu.
 func (bm *BackendManager) evictLRULocked() error {
 	var oldestID string
 	var oldestTime time.Time
 
 	for id, b := range bm.backends {
-		lastReq := b.lastRequest()
-		if oldestID == "" || lastReq.Before(oldestTime) {
-			oldestID = id
-			oldestTime = lastReq
+		if b.InFlight() == 0 {
+			lastReq := b.lastRequest()
+			if oldestID == "" || lastReq.Before(oldestTime) {
+				oldestID = id
+				oldestTime = lastReq
+			}
 		}
 	}
 
 	if oldestID == "" {
-		return fmt.Errorf("no backends to evict")
+		return fmt.Errorf("no evictable backends (all have active requests)")
 	}
 
 	bm.stopLocked(oldestID, bm.backends[oldestID])
@@ -325,6 +631,7 @@ func (bm *BackendManager) startBackendLocked(mc *ModelConfig) (*Backend, error) 
 		if _, ok := bm.backends[mc.ID]; ok && bm.backends[mc.ID] == b {
 			delete(bm.backends, mc.ID)
 			bm.portAlloc.release(b.Port)
+			bm.signalCapacityLocked()
 			bm.logger.Printf("%s removed dead backend (unexpected exit)", b.logPrefix)
 		}
 		bm.mu.Unlock()
@@ -350,54 +657,57 @@ func (bm *BackendManager) startBackendLocked(mc *ModelConfig) (*Backend, error) 
 	// Only profile when this is the sole backend, so the delta isn't
 	// corrupted by a concurrent model load (BUG-R2-3 fix).
 	// Skip if a valid (non-stale) cache entry already exists.
+	// Skip during explicit profiling (skipAutoProfile flag).
 	snap := mc.Snapshot(bm.cfg.Backend.CommonArgs)
-	if entry, ok := bm.vramCache[mc.ID]; !ok || !entry.Config.Equal(snap) {
-		if len(bm.backends) == 1 {
-			wasStale := ok
-			bm.mu.Unlock()
+	if !bm.skipAutoProfile.Load() {
+		if entry, ok := bm.vramCache[mc.ID]; !ok || !entry.Config.Equal(snap) {
+			if len(bm.backends) == 1 {
+				wasStale := ok
+				bm.mu.Unlock()
 
-			before, _ := queryVRAM(bm.cfg.Backend.NvidiaSMI)
-			time.Sleep(3 * time.Second)
-			after, err := queryVRAM(bm.cfg.Backend.NvidiaSMI)
+				before, _ := queryVRAM(bm.cfg.Backend.NvidiaSMI)
+				time.Sleep(3 * time.Second)
+				after, err := queryVRAM(bm.cfg.Backend.NvidiaSMI)
 
-			var profiledVram int
-			var profiledGPUVRAM []int
-			var profiledValid bool
-			if err == nil && after.Used > 0 {
-				used := after.Used
-				if before != nil && before.Used > 0 {
-					delta := after.Used - before.Used
-					if delta > 0 {
-						used = delta
+				var profiledVram int
+				var profiledGPUVRAM []int
+				var profiledValid bool
+				if err == nil && after.Used > 0 {
+					used := after.Used
+					if before != nil && before.Used > 0 {
+						delta := after.Used - before.Used
+						if delta > 0 {
+							used = delta
+						}
+					}
+					profiledGPUVRAM = computePerGPUDelta(before, after)
+					if verr := validateVRAMMeasurement(mc, used); verr != nil {
+						bm.logger.Printf("%s VRAM measurement rejected: %v (not caching)", b.logPrefix, verr)
+					} else {
+						profiledVram = used
+						profiledValid = true
 					}
 				}
-				profiledGPUVRAM = computePerGPUDelta(before, after)
-				if verr := validateVRAMMeasurement(mc, used); verr != nil {
-					bm.logger.Printf("%s VRAM measurement rejected: %v (not caching)", b.logPrefix, verr)
-				} else {
-					profiledVram = used
-					profiledValid = true
-				}
-			}
 
-			bm.mu.Lock()
-
-			if profiledValid {
-				bm.vramCache[mc.ID] = CacheEntry{Vram: profiledVram, GPUVRAM: profiledGPUVRAM, Config: snap}
-				// Copy cache and save outside the lock (MINOR-5 fix)
-				cacheCopy := make(VRAMCache, len(bm.vramCache))
-				for k, v := range bm.vramCache {
-					cacheCopy[k] = v
-				}
-				bm.mu.Unlock()
-				if saveErr := SaveVRAMCache(bm.vramCacheP, cacheCopy); saveErr != nil {
-					bm.logger.Printf("%s VRAM profiled: %d MB (auto) — cache save failed: %v", b.logPrefix, profiledVram, saveErr)
-				} else if wasStale {
-					bm.logger.Printf("%s VRAM re-profiled (config changed): %d MB (auto)", b.logPrefix, profiledVram)
-				} else {
-					bm.logger.Printf("%s VRAM profiled: %d MB (auto)", b.logPrefix, profiledVram)
-				}
 				bm.mu.Lock()
+
+				if profiledValid {
+					bm.vramCache[mc.ID] = CacheEntry{Vram: profiledVram, GPUVRAM: profiledGPUVRAM, Config: snap}
+					// Copy cache and save outside the lock (MINOR-5 fix)
+					cacheCopy := make(VRAMCache, len(bm.vramCache))
+					for k, v := range bm.vramCache {
+						cacheCopy[k] = v
+					}
+					bm.mu.Unlock()
+					if saveErr := SaveVRAMCache(bm.vramCacheP, cacheCopy); saveErr != nil {
+						bm.logger.Printf("%s VRAM profiled: %d MB (auto) — cache save failed: %v", b.logPrefix, profiledVram, saveErr)
+					} else if wasStale {
+						bm.logger.Printf("%s VRAM re-profiled (config changed): %d MB (auto)", b.logPrefix, profiledVram)
+					} else {
+						bm.logger.Printf("%s VRAM profiled: %d MB (auto)", b.logPrefix, profiledVram)
+					}
+					bm.mu.Lock()
+				}
 			}
 		}
 	}
@@ -421,14 +731,16 @@ func (bm *BackendManager) stopLocked(id string, b *Backend) {
 	}
 	bm.portAlloc.release(b.Port)
 	delete(bm.backends, id)
+	bm.signalCapacityLocked()
 }
 
 // StopModel unloads a specific model by ID. Resolves the canonical ID
-// from any accepted name (id, alias, or display name).
+// from any accepted name (id or display name). Returns an error if the
+// backend has active in-flight requests.
 func (bm *BackendManager) StopModel(id string) error {
 	mc := bm.cfg.FindModel(id)
 	if mc == nil {
-		return fmt.Errorf("model %s is not loaded", id)
+		return fmt.Errorf("unknown model: %s", id)
 	}
 	canonicalID := mc.ID
 
@@ -437,6 +749,9 @@ func (bm *BackendManager) StopModel(id string) error {
 	b, ok := bm.backends[canonicalID]
 	if !ok {
 		return fmt.Errorf("model %s is not loaded", id)
+	}
+	if b.InFlight() > 0 {
+		return fmt.Errorf("model %s has %d active request(s), cannot unload", id, b.InFlight())
 	}
 	bm.stopLocked(canonicalID, b)
 	return nil
@@ -509,13 +824,18 @@ func (bm *BackendManager) idleSweeper() {
 }
 
 func (bm *BackendManager) sweepIdle(idleLimit time.Duration) {
+	if bm.IsDraining() {
+		return
+	}
 	bm.mu.Lock()
 	defer bm.mu.Unlock()
 
 	now := time.Now()
 	for id, b := range bm.backends {
-		if now.Sub(b.lastRequest()) > idleLimit {
-			bm.stopLocked(id, b)
+		if b.InFlight() == 0 {
+			if now.Sub(b.lastRequest()) > idleLimit {
+				bm.stopLocked(id, b)
+			}
 		}
 	}
 }

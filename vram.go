@@ -306,9 +306,9 @@ func (m *ModelConfig) Snapshot(commonArgs []string) ModelConfigSnapshot {
 		CtxCheckpoints: m.CtxCheckpoints,
 		ExtraArgs:      m.ExtraArgs,
 		CommonArgs:     commonArgs,
-		Binary:          m.Binary,
-		Args:            m.Args,
-		Env:             envKeys,
+		Binary:         m.Binary,
+		Args:           m.Args,
+		Env:            envKeys,
 	}
 }
 

@@ -18,7 +18,7 @@ import (
 // args with {port} substitution instead of llama-server flags.
 func TestBuildArgsRawMode(t *testing.T) {
 	mc := &ModelConfig{
-		ID:  "test-ocr",
+		ID: "test-ocr",
 		Args: []string{
 			"serve",
 			"--port", "{port}",
@@ -45,7 +45,7 @@ func TestBuildArgsLlamaServerMode(t *testing.T) {
 	mc := &ModelConfig{
 		ID:          "test-model",
 		Path:        "/models/test.gguf",
-		Model:       "test-model",
+		Name:        "test-model",
 		ContextSize: 4096,
 		Parallel:    2,
 		Devices:     []string{"CUDA0"},
@@ -199,7 +199,7 @@ func TestConfigValidationCustomBinary(t *testing.T) {
 		Models: []ModelConfig{
 			{
 				ID:     "ocr-model",
-				Model:  "ocr-model",
+				Name:   "ocr-model",
 				Binary: "python3",
 				Args:   []string{"-m", "surya.server", "--port", "{port}"},
 			},
@@ -223,8 +223,8 @@ func TestConfigValidationLlamaServerRequiresPath(t *testing.T) {
 		Backend: BackendConfig{Binary: "/nonexistent/llama-server"},
 		Models: []ModelConfig{
 			{
-				ID:    "llama-model",
-				Model: "llama-model",
+				ID:   "llama-model",
+				Name: "llama-model",
 				// no Path, no Binary, no Args — should fail
 			},
 		},
@@ -323,7 +323,7 @@ backend:
 
 models:
   - id: mock-ocr
-    model: mock-ocr
+    name: mock-ocr
     binary: %q
     args:
       - "{port}"
