@@ -188,13 +188,17 @@ func (ps *ProxyServer) handleModelLoad(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	_, err = ps.bm.EnsureLoaded(req.Model)
+	b, err := ps.bm.EnsureLoaded(req.Model)
 	if err != nil {
 		w.Header().Set("Retry-After", "30")
 		writeJSONError(w, http.StatusServiceUnavailable,
 			fmt.Sprintf("failed to load model %s: %v", req.Model, err))
 		return
 	}
+	// EnsureLoaded incremented in-flight; this endpoint isn't forwarding
+	// a request, so decrement immediately.
+	b.InFlightDone()
+	ps.bm.SignalCapacity()
 
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]any{"success": true})
@@ -336,7 +340,9 @@ func (ps *ProxyServer) handleProxy(w http.ResponseWriter, r *http.Request) {
 	}
 
 	backend.Touch()
-	backend.InFlightAdd()
+	// In-flight was already incremented by EnsureLoaded to protect the
+	// backend during the gap between loading and forwarding. handleProxy
+	// owns the decrement via defer.
 	defer func() {
 		backend.InFlightDone()
 		ps.bm.SignalCapacity()

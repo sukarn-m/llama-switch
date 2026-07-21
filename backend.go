@@ -363,6 +363,7 @@ func (bm *BackendManager) EnsureLoaded(modelID string) (*Backend, error) {
 		// Fast path: already loaded
 		bm.mu.RLock()
 		if b, ok := bm.backends[canonicalID]; ok {
+			b.InFlightAdd()
 			bm.mu.RUnlock()
 			return b, nil
 		}
@@ -384,6 +385,7 @@ func (bm *BackendManager) EnsureLoaded(modelID string) (*Backend, error) {
 
 		// Double-check after acquiring write lock
 		if b, ok := bm.backends[canonicalID]; ok {
+			b.InFlightAdd()
 			bm.mu.Unlock()
 			return b, nil
 		}
@@ -441,6 +443,7 @@ func (bm *BackendManager) EnsureLoaded(modelID string) (*Backend, error) {
 			// Re-check fast path: another goroutine may have loaded
 			// this model while we were waiting for capacity.
 			if b, ok := bm.backends[canonicalID]; ok {
+				b.InFlightAdd()
 				bm.mu.Unlock()
 				return b, nil
 			}
@@ -459,6 +462,7 @@ func (bm *BackendManager) EnsureLoaded(modelID string) (*Backend, error) {
 		deleteLoading := func() {
 			delete(bm.loading, canonicalID)
 			loadCond.Broadcast()
+			bm.signalCapacityLocked()
 		}
 
 		// Retry loop: if the backend fails to start (e.g. CUDA OOM because
@@ -492,6 +496,7 @@ func (bm *BackendManager) EnsureLoaded(modelID string) (*Backend, error) {
 		}
 
 		deleteLoading()
+		b.InFlightAdd() // protect against eviction until handleProxy's defer takes over
 		bm.mu.Unlock()
 		return b, nil
 	}
