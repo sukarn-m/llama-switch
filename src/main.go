@@ -24,7 +24,8 @@ Usage:
 
 Commands:
   serve [config]        Start the proxy server (default).
-                        Config path defaults to ./config.yaml next to the binary.
+                        Config path defaults to ./config/config.yaml next to
+                        the binary (or ../config/ relative to the binary).
 
   profile [config]      Profile VRAM usage for each model.
                         Loads each model once (unloading others), measures
@@ -42,9 +43,9 @@ Environment:
 Config path resolution order:
   1. Positional argument
   2. $LLAMA_SWITCH_CONFIG
-  3. config.yaml next to the binary
+  3. config.yaml next to the binary (./ and ../config/ relative to it)
   4. ~/.config/llama-switch/config.yaml
-  5. ./config.yaml (current directory)
+  5. ./config/config.yaml (current directory)
 `
 
 // Version is the current llama-switch version. Bump on feature releases.
@@ -89,11 +90,14 @@ func parseConfigArg(args []string) string {
 	if p := os.Getenv("LLAMA_SWITCH_CONFIG"); p != "" {
 		return p
 	}
-	// Check next to the binary
+	// Check relative to the binary: same dir (./) and ../config/
 	if exe, err := os.Executable(); err == nil {
-		p := filepath.Join(filepath.Dir(exe), "config.yaml")
-		if _, err := os.Stat(p); err == nil {
-			return p
+		binDir := filepath.Dir(exe)
+		for _, rel := range []string{".", filepath.Join("..", "config")} {
+			p := filepath.Join(binDir, rel, "config.yaml")
+			if _, err := os.Stat(p); err == nil {
+				return p
+			}
 		}
 	}
 	// Check ~/.config/llama-switch/config.yaml
@@ -103,7 +107,7 @@ func parseConfigArg(args []string) string {
 			return p
 		}
 	}
-	return "config.yaml"
+	return filepath.Join("config", "config.yaml")
 }
 
 // ── serve ───────────────────────────────────

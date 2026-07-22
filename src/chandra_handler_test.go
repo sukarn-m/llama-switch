@@ -256,6 +256,292 @@ func TestProcessNonStreamWithThinking(t *testing.T) {
 	}
 }
 
+func TestStripThinkingDivVariations(t *testing.T) {
+	tests := []struct {
+		name  string
+		input string
+		want  string
+	}{
+		{
+			"div with space (standard)",
+			`Thinking\n<div data-label="Text"><p>Hello</p></div>`,
+			`<div data-label="Text"><p>Hello</p></div>`,
+		},
+		{
+			"div with newline",
+			"Thinking\n<div\ndata-label=\"Text\"><p>Hello</p></div>",
+			"<div\ndata-label=\"Text\"><p>Hello</p></div>",
+		},
+		{
+			"div with tab",
+			"Thinking\n<div\tdata-label=\"Text\"><p>Hello</p></div>",
+			"<div\tdata-label=\"Text\"><p>Hello</p></div>",
+		},
+		{
+			"div with no attributes",
+			`Thinking\n<div><p>Hello</p></div>`,
+			`<div><p>Hello</p></div>`,
+		},
+		{
+			"no div at all",
+			`Just thinking text`,
+			`Just thinking text`,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := stripThinking(tt.input)
+			if got != tt.want {
+				t.Errorf("stripThinking() = %q, want %q", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestHasHTMLDivVariations(t *testing.T) {
+	tests := []struct {
+		input string
+		want  bool
+	}{
+		{`<div data-label="Text">`, true},
+		{"<div\ndata-label=\"Text\">", true},
+		{"<div\tdata-label=\"Text\">", true},
+		{`<div>`, true},
+		{`<div`, false},
+		{`no html here`, false},
+		{`<span>not a div</span>`, false},
+	}
+	for _, tt := range tests {
+		if got := hasHTML(tt.input); got != tt.want {
+			t.Errorf("hasHTML(%q) = %v, want %v", tt.input, got, tt.want)
+		}
+	}
+}
+
+func TestExtractHTMLDivWithNewline(t *testing.T) {
+	h := &ChandraHandler{}
+
+	msg := map[string]any{
+		"content": "Thinking text\n<div\ndata-label=\"Text\"><p>Hello</p></div>",
+	}
+	got := h.extractHTML(msg)
+	if !strings.Contains(got, "Hello") {
+		t.Errorf("extractHTML with <div\\n: got %q, expected to contain 'Hello'", got)
+	}
+	if strings.Contains(got, "Thinking text") {
+		t.Errorf("extractHTML with <div\\n: thinking text should be stripped, got %q", got)
+	}
+}
+
+func TestProcessNonStreamDivWithNewline(t *testing.T) {
+	h := &ChandraHandler{}
+
+	response := map[string]any{
+		"id":     "test",
+		"object": "chat.completion",
+		"choices": []any{
+			map[string]any{
+				"index": 0,
+				"message": map[string]any{
+					"role":    "assistant",
+					"content": "Thinking\n<div\ndata-label=\"Text\"><p>Hello World</p></div>",
+				},
+				"finish_reason": "stop",
+			},
+		},
+	}
+	body, _ := json.Marshal(response)
+
+	processed, err := h.processNonStream(body)
+	if err != nil {
+		t.Fatalf("processNonStream error: %v", err)
+	}
+
+	var result map[string]any
+	json.Unmarshal(processed, &result)
+
+	choices := result["choices"].([]any)
+	msg := choices[0].(map[string]any)["message"].(map[string]any)
+	content := msg["content"].(string)
+
+	if strings.Contains(content, "<div") {
+		t.Errorf("content should be markdown, not HTML: %s", content)
+	}
+	if !strings.Contains(content, "Hello World") {
+		t.Errorf("content should contain 'Hello World': %s", content)
+	}
+	if strings.Contains(content, "Thinking") {
+		t.Errorf("thinking text should be stripped: %s", content)
+	}
+}
+
+func TestProcessNonStreamRawHTMLNotPassedThrough(t *testing.T) {
+	h := &ChandraHandler{}
+
+	rawHTML := `<div data-bbox="0 0 100 50" data-label="Section-Header"><p>RELIEVING LETTER</p></div>
+<div data-bbox="0 50 100 100" data-label="Text"><p>Dear Employee,</p></div>`
+
+	response := map[string]any{
+		"id":     "test",
+		"object": "chat.completion",
+		"choices": []any{
+			map[string]any{
+				"index": 0,
+				"message": map[string]any{
+					"role":              "assistant",
+					"content":           rawHTML,
+					"reasoning_content": "I need to extract the text.",
+				},
+				"finish_reason": "stop",
+			},
+		},
+	}
+	body, _ := json.Marshal(response)
+
+	processed, err := h.processNonStream(body)
+	if err != nil {
+		t.Fatalf("processNonStream error: %v", err)
+	}
+
+	var result map[string]any
+	json.Unmarshal(processed, &result)
+
+	choices := result["choices"].([]any)
+	msg := choices[0].(map[string]any)["message"].(map[string]any)
+	content := msg["content"].(string)
+
+	if strings.Contains(content, "data-bbox") {
+		t.Errorf("raw bbox attributes should not be in output: %s", content)
+	}
+	if strings.Contains(content, "<div") {
+		t.Errorf("HTML should be converted to markdown: %s", content)
+	}
+	if !strings.Contains(content, "RELIEVING LETTER") {
+		t.Errorf("content should contain extracted text: %s", content)
+	}
+	if _, ok := msg["reasoning_content"]; ok {
+		t.Errorf("reasoning_content should be removed")
+	}
+}
+
+func TestProcessNonStreamContentNullReasoningHTML(t *testing.T) {
+	h := &ChandraHandler{}
+
+	response := map[string]any{
+		"id":     "test",
+		"object": "chat.completion",
+		"choices": []any{
+			map[string]any{
+				"index": 0,
+				"message": map[string]any{
+					"role":              "assistant",
+					"content":           nil,
+					"reasoning_content": "Let me analyze.\n<div\ndata-label=\"Text\"><p>From Reasoning</p></div>",
+				},
+				"finish_reason": "stop",
+			},
+		},
+	}
+	body, _ := json.Marshal(response)
+
+	processed, err := h.processNonStream(body)
+	if err != nil {
+		t.Fatalf("processNonStream error: %v", err)
+	}
+
+	var result map[string]any
+	json.Unmarshal(processed, &result)
+
+	choices := result["choices"].([]any)
+	msg := choices[0].(map[string]any)["message"].(map[string]any)
+	content := msg["content"].(string)
+
+	if !strings.Contains(content, "From Reasoning") {
+		t.Errorf("content should contain text from reasoning_content: %s", content)
+	}
+	if strings.Contains(content, "Let me analyze") {
+		t.Errorf("thinking text should be stripped: %s", content)
+	}
+	if _, ok := msg["reasoning_content"]; ok {
+		t.Errorf("reasoning_content should be removed")
+	}
+}
+
+func TestProcessNonStreamFallbackStripsTags(t *testing.T) {
+	h := &ChandraHandler{}
+
+	response := map[string]any{
+		"id":     "test",
+		"object": "chat.completion",
+		"choices": []any{
+			map[string]any{
+				"index": 0,
+				"message": map[string]any{
+					"role":    "assistant",
+					"content": "<span>Raw</span> <b>text</b> with <unknown>tags</unknown>",
+				},
+				"finish_reason": "stop",
+			},
+		},
+	}
+	body, _ := json.Marshal(response)
+
+	processed, err := h.processNonStream(body)
+	if err != nil {
+		t.Fatalf("processNonStream error: %v", err)
+	}
+
+	var result map[string]any
+	json.Unmarshal(processed, &result)
+
+	choices := result["choices"].([]any)
+	msg := choices[0].(map[string]any)["message"].(map[string]any)
+	content := msg["content"].(string)
+
+	if strings.Contains(content, "<") {
+		t.Errorf("HTML tags should be stripped in fallback: %s", content)
+	}
+	if !strings.Contains(content, "Raw") || !strings.Contains(content, "text") {
+		t.Errorf("text content should be preserved: %s", content)
+	}
+}
+
+func TestProcessNonStreamNoHTMLSkipsCleanly(t *testing.T) {
+	h := &ChandraHandler{}
+
+	response := map[string]any{
+		"id":     "test",
+		"object": "chat.completion",
+		"choices": []any{
+			map[string]any{
+				"index": 0,
+				"message": map[string]any{
+					"role":    "assistant",
+					"content": "Just plain text with no HTML tags at all",
+				},
+				"finish_reason": "stop",
+			},
+		},
+	}
+	body, _ := json.Marshal(response)
+
+	processed, err := h.processNonStream(body)
+	if err != nil {
+		t.Fatalf("processNonStream error: %v", err)
+	}
+
+	var result map[string]any
+	json.Unmarshal(processed, &result)
+
+	choices := result["choices"].([]any)
+	msg := choices[0].(map[string]any)["message"].(map[string]any)
+	content := msg["content"].(string)
+
+	if content != "Just plain text with no HTML tags at all" {
+		t.Errorf("plain text should be left unchanged: %s", content)
+	}
+}
+
 // ── Integration test with a mock backend ─────────────────────────────
 
 func TestEndToEndChandraHandler(t *testing.T) {

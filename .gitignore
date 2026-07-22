@@ -1,6 +1,10 @@
 # Compiled binary
-llama-switch
+/bin/llama-switch
 
 # Machine-specific generated files
-vram-cache.json
-config.yaml
+/config/config.yaml
+/config/vram-cache.json
+
+# AI agent / tool working directories
+/.hermes/
+/.zcode/

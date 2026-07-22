@@ -9,7 +9,7 @@ Type=simple
 # Edit the IP to match your deployment, or remove the ExecStartPre line
 # if network availability is not a concern.
 # ExecStartPre=/bin/bash -c 'until ping -c 1 -W 1 <your-ip> >/dev/null 2>&1; do sleep 5; done'
-ExecStart=/path/to/llama-switch serve
+ExecStart=/path/to/llama-switch/bin/llama-switch serve
 WorkingDirectory=/path/to/llama-switch
 Environment=PATH=/usr/local/bin:/usr/bin:/bin:%h/.local/bin
 Restart=on-failure

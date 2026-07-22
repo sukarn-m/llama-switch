@@ -96,24 +96,54 @@ func (h *ChandraHandler) processNonStream(body []byte) ([]byte, error) {
 			continue
 		}
 
-		// Extract HTML from content or reasoning_content
-		html := h.extractHTML(msg)
-		if html == "" {
-			continue
+		markdown := h.processMessage(msg)
+		if markdown != "" {
+			msg["content"] = markdown
+			delete(msg, "reasoning_content")
 		}
-
-		// Convert HTML to markdown
-		markdown := htmlToMarkdown(html)
-
-		// Fix Devanagari conjunct errors
-		markdown = fixDevanagariConjuncts(markdown)
-
-		// Set the processed markdown as the content, clear reasoning
-		msg["content"] = markdown
-		delete(msg, "reasoning_content")
 	}
 
 	return json.Marshal(result)
+}
+
+// processMessage extracts HTML from the message, converts it to markdown,
+// and fixes Devanagari conjunct errors. Returns empty string if no
+// processable content was found.
+func (h *ChandraHandler) processMessage(msg map[string]any) string {
+	html := h.extractHTML(msg)
+	if html == "" {
+		html = h.fallbackExtract(msg)
+		if html == "" {
+			return ""
+		}
+	}
+
+	markdown := htmlToMarkdown(html)
+	if markdown == "" {
+		markdown = stripRemainingTags(html)
+	}
+	markdown = strings.TrimSpace(markdown)
+	if markdown == "" {
+		return ""
+	}
+	return fixDevanagariConjuncts(markdown)
+}
+
+// fallbackExtract returns raw content from content or reasoning_content
+// when extractHTML fails to find structured HTML. This catches edge cases
+// where the model's output format deviates slightly from expected patterns.
+func (h *ChandraHandler) fallbackExtract(msg map[string]any) string {
+	if content, ok := msg["content"].(string); ok && content != "" {
+		if strings.Contains(content, "<") {
+			return content
+		}
+	}
+	if reasoning, ok := msg["reasoning_content"].(string); ok && reasoning != "" {
+		if strings.Contains(reasoning, "<") {
+			return reasoning
+		}
+	}
+	return ""
 }
 
 // processStream handles a streaming /v1/chat/completions response.
@@ -182,11 +212,20 @@ func (h *ChandraHandler) processStream(body []byte) ([]byte, error) {
 
 	html := h.extractHTML(msg)
 	if html == "" {
-		// No HTML found, return original
+		html = h.fallbackExtract(msg)
+	}
+	if html == "" {
 		return body, nil
 	}
 
 	markdown := htmlToMarkdown(html)
+	if markdown == "" {
+		markdown = stripRemainingTags(html)
+	}
+	markdown = strings.TrimSpace(markdown)
+	if markdown == "" {
+		return body, nil
+	}
 	markdown = fixDevanagariConjuncts(markdown)
 
 	msg["content"] = markdown
@@ -236,18 +275,20 @@ func (h *ChandraHandler) extractHTML(msg map[string]any) string {
 
 // stripThinking removes any text before the first <div> tag.
 // Chandra sometimes leaks chain-of-thought into the output.
-var divStartRegex = regexp.MustCompile(`(?s)^.*?(<div\s)`)
+// The regex matches <div followed by any whitespace or >, covering
+// <div data-...>, <div\n...>, <div\t...>, and <div> (no attributes).
+var divStartRegex = regexp.MustCompile(`(?s)^.*?(<div[\s>])`)
 
 func stripThinking(s string) string {
 	loc := divStartRegex.FindStringSubmatchIndex(s)
 	if loc != nil {
-		return s[loc[1]-len("<div "):]
+		return s[loc[2]:]
 	}
 	return s
 }
 
 func hasHTML(s string) bool {
-	return strings.Contains(s, "<div ") || strings.Contains(s, "<div>")
+	return divStartRegex.MatchString(s)
 }
 
 // ── HTML to Markdown conversion ─────────────────────────────────────

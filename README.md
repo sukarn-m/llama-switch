@@ -4,7 +4,7 @@ A GPU model multiplexer for [llama-server](https://github.com/ggml-org/llama.cpp
 
 No model is loaded until the first request for it arrives. When VRAM is tight, the least-recently-used model is evicted to make room. Each model runs as a separate `llama-server` process on a loopback port; clients only ever talk to the proxy.
 
-**This project is configured via `config.yaml` (gitignored). Copy `config.example.yaml` as a starting point and configure for your own hardware and models.**
+> **Config:** llama-switch is configured via `config/config.yaml` (gitignored). Copy `config/config.example.yaml` as a starting point and configure for your own hardware and models.
 
 ## How it works
 
@@ -26,31 +26,33 @@ Key behaviours:
 
 - **On-demand loading** — no GPU memory used until a model is requested
 - **LRU eviction** — when a new model won't fit, the least-recently-used one is unloaded
-- **Idle timeout** — models unload automatically after 60 minutes with no requests
-- **Per-GPU VRAM admission control** — profiling captures per-GPU VRAM usage; admission checks each GPU individually (see [VRAM profiling](#vram-profiling))
+- **Idle timeout** — models unload automatically after 60 minutes (configurable) with no requests
+- **Per-GPU VRAM admission control** — profiling captures per-GPU VRAM usage; admission checks each GPU individually (see [VRAM & scheduling](#vram--scheduling))
 - **Per-model runtime override** — models can use custom binaries (vLLM, Python servers) with their own args, env, and health endpoints (see [Per-model runtime override](#per-model-runtime-override))
 - **Model handlers** — pluggable response post-processing for models that need it (e.g. Chandra 2 OCR: HTML-to-markdown conversion, Devanagari conjunct fixes) (see [Model handlers](#model-handlers))
 - **Stdout prefixing** — each backend's log output is prefixed with `[model-id]`
 - **OpenAI-compatible** — works with Open WebUI, opencode, agent frameworks, and anything that speaks the OpenAI Chat Completions API
 
-## Requirements
+## Getting started
+
+### Requirements
 
 - Linux with NVIDIA GPUs and `nvidia-smi`
 - `llama-server` binary (CUDA build)
 - Go 1.26+ (to build)
 
-## Build
+### Build
 
 ```bash
-go build -o llama-switch .
+mkdir -p bin && go build -o bin/llama-switch ./src
 ```
 
-## Configure
+### Configure
 
 Copy the template and edit for your machine:
 
 ```bash
-cp config.example.yaml config.yaml
+cp config/config.example.yaml config/config.yaml
 ```
 
 Key settings:
@@ -70,37 +72,43 @@ Key settings:
 | `models[].path` | Path to `.gguf` file |
 | `models[].devices` | Which CUDA devices to use |
 
-## Usage
+After configuring, profile each model's VRAM usage once so admission control has data to work with:
+
+```bash
+./bin/llama-switch profile
+```
+
+### Run
 
 ```bash
 # Start the proxy
-./llama-switch serve
+./bin/llama-switch serve
 
 # List configured models and VRAM estimates (includes PER-GPU column)
-./llama-switch models
-
-# Profile VRAM for all unprofiled models (loads each one at a time)
-./llama-switch profile
-
-# Force re-profiling (skip cache)
-./llama-switch profile --force
-
-# Query loaded models on a running server
-curl http://localhost:8080/v1/loaded
+./bin/llama-switch models
 ```
 
-### Remote profiling
+The `model` field in API requests accepts the display name or the short ID. The proxy loads the model on first request (blocking up to `health_timeout_seconds`), then forwards the request.
 
-If `llama-switch serve` is already running, the `profile` command automatically detects it and delegates profiling to the running service:
+### Run as a systemd service
+
+A user service unit is included. Install:
 
 ```bash
-./llama-switch profile              # auto-detects running service
-./llama-switch profile --force      # force re-profiling (skip cache)
+cp config/llama-switch.service ~/.config/systemd/user/
+systemctl --user daemon-reload
+systemctl --user enable --now llama-switch
 ```
 
-The service drains active requests (up to `profile_drain_seconds`, default 60s), evicts all backends, profiles each model one at a time, and streams progress via SSE. New requests during profiling get `503` with `Retry-After: 60`.
+Tail logs:
 
-### Sending requests
+```bash
+journalctl --user -u llama-switch -f
+```
+
+## Using the API
+
+### Chat completions
 
 ```bash
 curl -X POST http://localhost:8080/v1/chat/completions \
@@ -111,8 +119,6 @@ curl -X POST http://localhost:8080/v1/chat/completions \
     "max_tokens": 100
   }'
 ```
-
-The `model` field accepts the display name or the short ID. The proxy loads the model on first request (blocking up to `health_timeout_seconds`), then forwards the request.
 
 ### Explicit load / unload
 
@@ -128,36 +134,42 @@ curl -X POST http://localhost:8080/models/unload \
   -d '{"model": "Ornith-1.0-9B"}'
 ```
 
-## systemd
-
-A user service unit is included. Install:
+### Inspect state
 
 ```bash
-cp llama-switch.service ~/.config/systemd/user/
-systemctl --user daemon-reload
-systemctl --user enable --now llama-switch
+# Query loaded models on a running server
+curl http://localhost:8080/v1/loaded
 ```
 
-Logs:
+## VRAM & scheduling
+
+llama-switch profiles VRAM usage by loading each model, measuring the delta via `nvidia-smi`, and caching the result in `config/vram-cache.json`. This cache drives admission control: when a model is requested, the proxy checks whether enough VRAM is free before loading it (evicting LRU models if necessary).
+
+**Per-GPU admission control.** Profiling captures VRAM usage per GPU (not just aggregate). The cache file has a `gpu_vram` field — an array of MB values indexed by `nvidia-smi` GPU index. When deciding whether a model fits, `ensureCapacityLocked` checks each GPU the model targets individually: every GPU must have enough free VRAM for the model's profiled share on that GPU.
+
+**Headroom.** A 1024 MB (1 GB) safety margin is applied to the **primary GPU only** (CUDA0 / index 0) to account for OS and display-server VRAM overhead. Secondary GPUs have no display output, so no headroom is added for them.
+
+**Validation.** Profiled VRAM measurements are validated before caching. A measurement is rejected if it is below 256 MB or below the model's `.gguf` file size — both indicate a corrupted or incomplete measurement. This applies to both the `profile` command and auto-profiling during `serve`.
+
+**Fallback.** If per-GPU data is unavailable (e.g. legacy cache entries without `gpu_vram`), admission control falls back to the aggregate VRAM check.
+
+### Profiling commands
 
 ```bash
-journalctl --user -u llama-switch -f
+./bin/llama-switch profile              # profile all unprofiled models
+./bin/llama-switch profile --force      # force re-profiling (skip cache)
 ```
 
-## Project structure
+### Remote profiling
 
-| File | Purpose |
-|---|---|
-| `main.go` | CLI entry point (`serve`, `profile`, `models`, `status`) |
-| `config.go` | Config types, YAML loading, path expansion, argument building, per-model binary/env resolution |
-| `backend.go` | Backend process lifecycle, port allocation, health checks, LRU eviction, idle sweeper |
-| `proxy.go` | HTTP proxy server, model routing, streaming support, load/unload endpoints, model handler hook |
-| `chandra_handler.go` | Model handler for Chandra 2 OCR (HTML→markdown, Devanagari fixes, thinking stripping) |
-| `vram.go` | `nvidia-smi` querying, VRAM cache, per-GPU admission control |
-| `logger.go` | Thin stdout logger |
-| `llama_switch_test.go` | Tests for per-model runtime override |
-| `chandra_handler_test.go` | Tests for the Chandra OCR handler |
-| `config.example.yaml` | Configuration template |
+If `llama-switch serve` is already running, the `profile` command automatically detects it and delegates profiling to the running service:
+
+```bash
+./bin/llama-switch profile              # auto-detects running service
+./bin/llama-switch profile --force      # force re-profiling (skip cache)
+```
+
+The service drains active requests (up to `profile_drain_seconds`, default 60s), evicts all backends, profiles each model one at a time, and streams progress via SSE. New requests during profiling get `503` with `Retry-After: 60`.
 
 ## Per-model runtime override
 
@@ -208,7 +220,7 @@ When a request targets a model with a registered handler, the proxy forces non-s
 
 ### Chandra 2 OCR handler
 
-The included Chandra handler (`chandra_handler.go`) post-processes responses from the [Chandra 2 OCR](https://huggingface.co/datalab-to/chandra-ocr-2) model. Chandra is a Qwen3.5-based VLM that outputs structured HTML with bounding boxes. The handler:
+The included Chandra handler (`src/chandra_handler.go`) post-processes responses from the [Chandra 2 OCR](https://huggingface.co/datalab-to/chandra-ocr-2) model. Chandra is a Qwen3.5-based VLM that outputs structured HTML with bounding boxes. The handler:
 
 1. Extracts HTML from `content` or `reasoning_content` (handles Qwen3.5 thinking mode)
 2. Strips chain-of-thought leakage
@@ -218,19 +230,23 @@ The included Chandra handler (`chandra_handler.go`) post-processes responses fro
 
 Clients send a standard chat completions request with an `image_url` and receive clean markdown in the `content` field — no knowledge of the model's HTML format is required.
 
-**To remove the handler:** delete `chandra_handler.go` and `chandra_handler_test.go`, remove the registration line in `NewModelHandler()`. The generic handler infrastructure in `proxy.go` stays for future use.
+**To remove the handler:** delete `src/chandra_handler.go` and `src/chandra_handler_test.go`, remove the registration line in `NewModelHandler()`. The generic handler infrastructure in `src/proxy.go` stays for future use.
 
-## VRAM profiling
+## Project structure
 
-llama-switch profiles VRAM usage by loading each model, measuring the delta via `nvidia-smi`, and caching the result in `vram-cache.json`. This cache drives admission control: when a model is requested, the proxy checks whether enough VRAM is free before loading it (evicting LRU models if necessary).
-
-**Per-GPU admission control.** Profiling captures VRAM usage per GPU (not just aggregate). The cache file has a `gpu_vram` field — an array of MB values indexed by `nvidia-smi` GPU index. When deciding whether a model fits, `ensureCapacityLocked` checks each GPU the model targets individually: every GPU must have enough free VRAM for the model's profiled share on that GPU.
-
-**Headroom.** A 1024 MB (1 GB) safety margin is applied to the **primary GPU only** (CUDA0 / index 0) to account for OS and display-server VRAM overhead. Secondary GPUs have no display output, so no headroom is added for them.
-
-**Validation.** Profiled VRAM measurements are validated before caching. A measurement is rejected if it is below 256 MB or below the model's `.gguf` file size — both indicate a corrupted or incomplete measurement. This applies to both the `profile` command and auto-profiling during `serve`.
-
-**Fallback.** If per-GPU data is unavailable (e.g. legacy cache entries without `gpu_vram`), admission control falls back to the aggregate VRAM check.
+| Path | Purpose |
+|---|---|
+| `src/main.go` | CLI entry point (`serve`, `profile`, `models`, `status`) |
+| `src/config.go` | Config types, YAML loading, path expansion, argument building, per-model binary/env resolution |
+| `src/backend.go` | Backend process lifecycle, port allocation, health checks, LRU eviction, idle sweeper |
+| `src/proxy.go` | HTTP proxy server, model routing, streaming support, load/unload endpoints, model handler hook |
+| `src/chandra_handler.go` | Model handler for Chandra 2 OCR (HTML→markdown, Devanagari fixes, thinking stripping) |
+| `src/vram.go` | `nvidia-smi` querying, VRAM cache, per-GPU admission control |
+| `src/logger.go` | Thin stdout logger |
+| `src/*_test.go` | Unit and integration tests |
+| `config/config.example.yaml` | Configuration template |
+| `config/llama-switch.service` | systemd user unit |
+| `bin/` | Compiled binary (built by `go build -o bin/llama-switch ./src`) |
 
 ## License
 
