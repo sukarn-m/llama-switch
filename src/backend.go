@@ -327,7 +327,7 @@ func (bm *BackendManager) profileSingleModel(mc *ModelConfig) (int, []int, error
 
 	after, err := queryVRAM(bm.cfg.Backend.NvidiaSMI)
 	if err != nil {
-		_ = bm.StopModel(mc.ID)
+		_ = bm.StopModel(mc.ID, true)
 		return 0, nil, fmt.Errorf("post-load VRAM query: %w", err)
 	}
 
@@ -337,7 +337,7 @@ func (bm *BackendManager) profileSingleModel(mc *ModelConfig) (int, []int, error
 	}
 	gpuVRAM := computePerGPUDelta(before, after)
 
-	_ = bm.StopModel(mc.ID)
+	_ = bm.StopModel(mc.ID, true)
 
 	if verr := validateVRAMMeasurement(mc, used); verr != nil {
 		return 0, nil, verr
@@ -396,16 +396,23 @@ func (bm *BackendManager) EnsureLoaded(modelID string) (*Backend, error) {
 			return nil, fmt.Errorf("service is draining (profiling or maintenance in progress)")
 		}
 
+		// Register as loading BEFORE ensureCapacityLocked so other
+		// goroutines account for our pending VRAM during the eviction
+		// sleep window (lines 596-598 in ensureCapacityLocked release
+		// and re-acquire the lock). Without this, two models can race
+		// past the VRAM check simultaneously.
+		loadCond := sync.NewCond(&bm.mu)
+		bm.loading[canonicalID] = loadCond
+		deleteLoading := func() {
+			delete(bm.loading, canonicalID)
+			loadCond.Broadcast()
+			bm.signalCapacityLocked()
+		}
+
 		// Wait for capacity: if we can't evict right now (all backends
 		// in-flight), block on capCh until a request completes and frees
 		// capacity. Already-loaded-model requests hit the fast path
 		// above and never reach here.
-		//
-		// IMPORTANT: the loading map registration happens AFTER this
-		// wait, not before. If we registered first, len(loading) would
-		// count against MaxModels in ensureCapacityLocked, causing a
-		// deadlock when two goroutines wait for different models
-		// simultaneously (both count each other's loading entry).
 		queueTimeout := time.Duration(bm.cfg.Server.QueueTimeoutSeconds) * time.Second
 		deadline := time.Now().Add(queueTimeout)
 
@@ -413,6 +420,7 @@ func (bm *BackendManager) EnsureLoaded(modelID string) (*Backend, error) {
 			// Check queue depth limit
 			currentDepth := atomic.LoadInt64(&bm.queueDepth)
 			if int(currentDepth) >= bm.cfg.Server.QueueMaxDepth {
+				deleteLoading()
 				bm.mu.Unlock()
 				return nil, fmt.Errorf("queue full (%d pending requests)", currentDepth)
 			}
@@ -423,6 +431,7 @@ func (bm *BackendManager) EnsureLoaded(modelID string) (*Backend, error) {
 			}
 
 			if time.Now().After(deadline) {
+				deleteLoading()
 				bm.mu.Unlock()
 				return nil, fmt.Errorf("queue timeout after %v waiting for capacity: %w", queueTimeout, err)
 			}
@@ -443,6 +452,7 @@ func (bm *BackendManager) EnsureLoaded(modelID string) (*Backend, error) {
 			// Re-check fast path: another goroutine may have loaded
 			// this model while we were waiting for capacity.
 			if b, ok := bm.backends[canonicalID]; ok {
+				deleteLoading()
 				b.InFlightAdd()
 				bm.mu.Unlock()
 				return b, nil
@@ -450,19 +460,10 @@ func (bm *BackendManager) EnsureLoaded(modelID string) (*Backend, error) {
 
 			// Re-check drain mode after waking
 			if bm.IsDraining() {
+				deleteLoading()
 				bm.mu.Unlock()
 				return nil, fmt.Errorf("service is draining (profiling or maintenance in progress)")
 			}
-		}
-
-		// Now register as loading so concurrent requests for the same
-		// model wait on loadCond instead of trying to load it again.
-		loadCond := sync.NewCond(&bm.mu)
-		bm.loading[canonicalID] = loadCond
-		deleteLoading := func() {
-			delete(bm.loading, canonicalID)
-			loadCond.Broadcast()
-			bm.signalCapacityLocked()
 		}
 
 		// Retry loop: if the backend fails to start (e.g. CUDA OOM because
@@ -508,9 +509,10 @@ func (bm *BackendManager) EnsureLoaded(modelID string) (*Backend, error) {
 // Caller must hold bm.mu.
 func (bm *BackendManager) ensureCapacityLocked(mc *ModelConfig) error {
 	// 1. Count limit: evict if loaded + loading would exceed MaxModels.
-	// Note: the caller hasn't registered in loading yet (it's done after
-	// capacity is secured), so we add 1 to account for the model being loaded.
-	for len(bm.backends)+len(bm.loading)+1 > bm.cfg.Server.MaxModels {
+	// The caller is already registered in bm.loading (done in EnsureLoaded
+	// before calling us), so len(loading) already includes this model.
+	// We add 0 (not 1) since we're already counted.
+	for len(bm.backends)+len(bm.loading) > bm.cfg.Server.MaxModels {
 		if err := bm.evictLRULocked(); err != nil {
 			return fmt.Errorf("cannot make room for %s: %w", mc.ID, err)
 		}
@@ -525,6 +527,9 @@ func (bm *BackendManager) ensureCapacityLocked(mc *ModelConfig) error {
 		// two big models simultaneously.
 		pendingPerGPU := make([]int, 0)
 		for loadID := range bm.loading {
+			if loadID == mc.ID {
+				continue // skip ourselves; we're checking if WE fit
+			}
 			lmc := bm.cfg.FindModel(loadID)
 			if lmc == nil {
 				continue
@@ -584,10 +589,18 @@ func (bm *BackendManager) ensureCapacityLocked(mc *ModelConfig) error {
 				break // nothing left to evict and nothing loading; try anyway
 			}
 			if len(bm.backends) == 0 {
-				// Can't evict, but a model is loading — its VRAM isn't
-				// reflected in nvidia-smi yet. Return an error so the
-				// caller blocks in the capacity queue until it finishes.
-				return fmt.Errorf("waiting for %d loading model(s) to free VRAM", len(bm.loading))
+				// Can't evict. If OTHER models are loading (not us),
+				// wait for them — their VRAM isn't reflected in
+				// nvidia-smi yet. If we're the only one loading,
+				// there's nothing to wait for; break and try loading.
+				otherLoading := len(bm.loading)
+				if _, ok := bm.loading[mc.ID]; ok {
+					otherLoading--
+				}
+				if otherLoading > 0 {
+					return fmt.Errorf("waiting for %d loading model(s) to free VRAM", otherLoading)
+				}
+				break
 			}
 			if err := bm.evictLRULocked(); err != nil {
 				return err
@@ -798,9 +811,10 @@ func (bm *BackendManager) stopLocked(id string, b *Backend) {
 }
 
 // StopModel unloads a specific model by ID. Resolves the canonical ID
-// from any accepted name (id or display name). Returns an error if the
-// backend has active in-flight requests.
-func (bm *BackendManager) StopModel(id string) error {
+// from any accepted name (id or display name). When force is false,
+// returns an error if the backend has active in-flight requests.
+// When force is true, kills the backend regardless of active requests.
+func (bm *BackendManager) StopModel(id string, force bool) error {
 	mc := bm.cfg.FindModel(id)
 	if mc == nil {
 		return fmt.Errorf("unknown model: %s", id)
@@ -813,7 +827,7 @@ func (bm *BackendManager) StopModel(id string) error {
 	if !ok {
 		return fmt.Errorf("model %s is not loaded", id)
 	}
-	if b.InFlight() > 0 {
+	if !force && b.InFlight() > 0 {
 		return fmt.Errorf("model %s has %d active request(s), cannot unload", id, b.InFlight())
 	}
 	bm.stopLocked(canonicalID, b)

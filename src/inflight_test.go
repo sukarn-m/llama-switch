@@ -137,15 +137,44 @@ func TestStopModelRefusesInFlight(t *testing.T) {
 
 	b.InFlightAdd()
 
-	err := bm.StopModel("a")
+	err := bm.StopModel("a", false)
 	if err == nil {
 		t.Fatal("expected error when stopping in-flight backend")
 	}
 
 	b.InFlightDone()
-	err = bm.StopModel("a")
+	err = bm.StopModel("a", false)
 	if err != nil {
 		t.Fatalf("expected success after in-flight completes, got: %v", err)
+	}
+}
+
+func TestStopModelForceKillsInFlight(t *testing.T) {
+	cfg := &Config{
+		Server: ServerConfig{MaxModels: 1, BackendPortStart: 18201, BackendPortEnd: 18299,
+			QueueMaxDepth: 64, QueueTimeoutSeconds: 5},
+		Models: []ModelConfig{{ID: "a", Name: "a", Path: "/dev/null"}},
+	}
+	bm := NewBackendManager(cfg, "", NewLogger())
+
+	b := &Backend{ID: "a", Port: 18201}
+	bm.mu.Lock()
+	bm.backends["a"] = b
+	bm.mu.Unlock()
+
+	b.InFlightAdd()
+	defer b.InFlightDone()
+
+	err := bm.StopModel("a", true)
+	if err != nil {
+		t.Fatalf("expected force stop to succeed despite in-flight, got: %v", err)
+	}
+
+	bm.mu.RLock()
+	_, exists := bm.backends["a"]
+	bm.mu.RUnlock()
+	if exists {
+		t.Fatal("backend should have been removed by force stop")
 	}
 }
 
@@ -240,6 +269,73 @@ func TestCapacityQueueTimeout(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "queue timeout") {
 		t.Fatalf("expected queue timeout error, got: %v", err)
+	}
+}
+
+func TestCapacityQueueProceedsAfterBackendKilled(t *testing.T) {
+	// Simulate: model A is loaded and in-flight. Model B enters the
+	// capacity queue (registered in loading). Then A's process is
+	// killed (reaper removes it from backends map and signals capacity).
+	// B should proceed to load instead of deadlocking on itself.
+	cfg := &Config{
+		Server: ServerConfig{
+			MaxModels:           1,
+			BackendPortStart:    18201,
+			BackendPortEnd:      18299,
+			QueueMaxDepth:       64,
+			QueueTimeoutSeconds: 5,
+		},
+		Models: []ModelConfig{
+			{ID: "a", Name: "a", Path: "/dev/null"},
+			{ID: "b", Name: "b", Path: "/dev/null"},
+		},
+	}
+	bm := NewBackendManager(cfg, "", NewLogger())
+
+	bmA := &Backend{ID: "a", Port: 18201}
+	bmA.setLastRequest(time.Now())
+	bmA.InFlightAdd()
+	bm.mu.Lock()
+	bm.backends["a"] = bmA
+	bm.mu.Unlock()
+
+	done := make(chan error, 1)
+	go func() {
+		_, err := bm.EnsureLoaded("b")
+		done <- err
+	}()
+
+	// Wait for B to enter the queue
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if atomic.LoadInt64(&bm.queueDepth) == 1 {
+			break
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	if depth := atomic.LoadInt64(&bm.queueDepth); depth != 1 {
+		t.Fatalf("expected queue depth 1, got %d", depth)
+	}
+
+	// Simulate process kill: reaper removes backend and signals capacity.
+	// The in-flight counter is still > 0 (the request that was using A
+	// hasn't called InFlightDone yet — it will get an error from the
+	// dead backend). But the reaper doesn't wait for that.
+	bm.mu.Lock()
+	delete(bm.backends, "a")
+	bm.portAlloc.release(bmA.Port)
+	bm.signalCapacityLocked()
+	bm.mu.Unlock()
+
+	// B should now proceed. It will fail to start (no real binary),
+	// but it should NOT hang in the queue.
+	select {
+	case err := <-done:
+		// We expect an error (no real llama-server binary), but the
+		// key point is that it unblocked and tried to load.
+		_ = err
+	case <-time.After(10 * time.Second):
+		t.Fatal("EnsureLoaded deadlocked after backend was killed — queue self-deadlock")
 	}
 }
 

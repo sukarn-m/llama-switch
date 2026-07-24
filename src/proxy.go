@@ -214,6 +214,7 @@ func (ps *ProxyServer) handleModelUnload(w http.ResponseWriter, r *http.Request)
 
 	var req struct {
 		Model string `json:"model"`
+		Force bool   `json:"force"`
 	}
 	if err := json.Unmarshal(body, &req); err != nil || req.Model == "" {
 		writeJSONError(w, http.StatusBadRequest, "missing or invalid 'model' field")
@@ -232,7 +233,7 @@ func (ps *ProxyServer) handleModelUnload(w http.ResponseWriter, r *http.Request)
 		return
 	}
 
-	err = ps.bm.StopModel(req.Model)
+	err = ps.bm.StopModel(req.Model, req.Force)
 	if err != nil {
 		if strings.Contains(err.Error(), "active request(s)") {
 			writeJSONError(w, http.StatusConflict,

@@ -110,6 +110,11 @@ func (h *ChandraHandler) processNonStream(body []byte) ([]byte, error) {
 // and fixes Devanagari conjunct errors. Returns empty string if no
 // processable content was found.
 func (h *ChandraHandler) processMessage(msg map[string]any) string {
+	// Try raw JSON bbox array first (fallback when model fails to produce HTML)
+	if md := h.tryBboxJSON(msg); md != "" {
+		return fixDevanagariConjuncts(md)
+	}
+
 	html := h.extractHTML(msg)
 	if html == "" {
 		html = h.fallbackExtract(msg)
@@ -144,6 +149,84 @@ func (h *ChandraHandler) fallbackExtract(msg map[string]any) string {
 		}
 	}
 	return ""
+}
+
+// tryBboxJSON checks if the message content is a raw JSON array of bounding
+// box objects (as Chandra 2 sometimes outputs when HTML formatting fails).
+// If so, it extracts text from the objects and returns it as plain text.
+// Returns empty string if the content is not parseable as bbox JSON or
+// contains no extractable text.
+func (h *ChandraHandler) tryBboxJSON(msg map[string]any) string {
+	raw := ""
+	if content, ok := msg["content"].(string); ok && content != "" {
+		raw = content
+	} else if reasoning, ok := msg["reasoning_content"].(string); ok && reasoning != "" {
+		raw = reasoning
+	}
+	if raw == "" {
+		return ""
+	}
+	return extractBboxText(raw)
+}
+
+// extractBboxText attempts to parse a string as a JSON array of bbox objects
+// and extracts text content from them. Handles both flat arrays ([{...}])
+// and nested arrays ([[{...}]]). Each object may have a "text" or "content"
+// field with the actual text. Returns empty string if parsing fails or no
+// text is found.
+func extractBboxText(s string) string {
+	s = strings.TrimSpace(s)
+	// Quick reject: must start with [ to be a JSON array
+	if len(s) == 0 || s[0] != '[' {
+		return ""
+	}
+
+	var arr []any
+	if err := json.Unmarshal([]byte(s), &arr); err != nil {
+		return ""
+	}
+
+	// Handle nested arrays: [[{...}], [{...}]]
+	if len(arr) > 0 {
+		if _, ok := arr[0].([]any); ok {
+			var flat []any
+			for _, item := range arr {
+				if subArr, ok := item.([]any); ok {
+					flat = append(flat, subArr...)
+				}
+			}
+			if len(flat) > 0 {
+				arr = flat
+			}
+		}
+	}
+
+	var texts []string
+	for _, item := range arr {
+		obj, ok := item.(map[string]any)
+		if !ok {
+			continue
+		}
+		// Extract text field (primary), fall back to content field
+		text := ""
+		if t, ok := obj["text"].(string); ok {
+			text = t
+		} else if c, ok := obj["content"].(string); ok {
+			text = c
+		}
+		text = strings.TrimSpace(text)
+		if text != "" {
+			texts = append(texts, text)
+		}
+	}
+
+	if len(texts) == 0 {
+		return ""
+	}
+
+	result := strings.Join(texts, "\n\n")
+	result = multiBlankRegex.ReplaceAllString(result, "\n\n")
+	return strings.TrimSpace(result)
 }
 
 // processStream handles a streaming /v1/chat/completions response.
@@ -208,6 +291,32 @@ func (h *ChandraHandler) processStream(body []byte) ([]byte, error) {
 	}
 	if fullReasoning != "" {
 		msg["reasoning_content"] = fullReasoning
+	}
+
+	// Try raw JSON bbox array first (fallback when model fails to produce HTML)
+	if md := h.tryBboxJSON(msg); md != "" {
+		markdown := fixDevanagariConjuncts(md)
+		msg["content"] = markdown
+		delete(msg, "reasoning_content")
+
+		// Build the response
+		result := map[string]any{
+			"id":     "chandra-processed",
+			"object": "chat.completion",
+			"choices": []any{
+				map[string]any{
+					"index":         0,
+					"message":       msg,
+					"finish_reason": "stop",
+				},
+			},
+		}
+		if firstChunk != nil {
+			if model, ok := firstChunk["model"]; ok {
+				result["model"] = model
+			}
+		}
+		return json.Marshal(result)
 	}
 
 	html := h.extractHTML(msg)

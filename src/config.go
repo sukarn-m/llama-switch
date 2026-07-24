@@ -34,11 +34,12 @@ type ServerConfig struct {
 }
 
 type BackendConfig struct {
-	Binary     string            `yaml:"binary"`
-	Env        map[string]string `yaml:"env"`
-	CommonArgs []string          `yaml:"common_args"`
-	Workdir    string            `yaml:"workdir"`
-	NvidiaSMI  string            `yaml:"nvidia_smi"`
+	Binary         string            `yaml:"binary"`
+	Env            map[string]string `yaml:"env"`
+	CommonArgs     []string          `yaml:"common_args"`
+	Workdir        string            `yaml:"workdir"`
+	NvidiaSMI      string            `yaml:"nvidia_smi"`
+	CtxCheckpoints int               `yaml:"ctx_checkpoints"`
 }
 
 type ModelConfig struct {
@@ -142,6 +143,15 @@ func LoadConfig(path string) (*Config, error) {
 	}
 	if cfg.Backend.NvidiaSMI == "" {
 		cfg.Backend.NvidiaSMI = "nvidia-smi"
+	}
+
+	// Apply global ctx_checkpoints default to models that don't set their own.
+	if cfg.Backend.CtxCheckpoints != 0 {
+		for i := range cfg.Models {
+			if cfg.Models[i].CtxCheckpoints == 0 {
+				cfg.Models[i].CtxCheckpoints = cfg.Backend.CtxCheckpoints
+			}
+		}
 	}
 
 	return &cfg, nil
