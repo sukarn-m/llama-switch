@@ -66,6 +66,64 @@ func TestBuildArgsLlamaServerMode(t *testing.T) {
 	}
 }
 
+// TestBuildArgsCacheRAM tests that cache_ram is emitted as --cache-ram,
+// including the distinction between nil (omit), 0 (disable), and a
+// positive value.
+func TestBuildArgsCacheRAM(t *testing.T) {
+	// Case 1: CacheRAM nil → no --cache-ram flag
+	mc1 := &ModelConfig{
+		ID:          "test-nil",
+		Path:        "/models/test.gguf",
+		ContextSize: 4096,
+	}
+	args1 := mc1.BuildArgs(nil, 8301)
+	for _, a := range args1 {
+		if a == "--cache-ram" {
+			t.Fatalf("expected no --cache-ram when CacheRAM is nil, got: %v", args1)
+		}
+	}
+
+	// Case 2: CacheRAM = 0 → --cache-ram 0
+	zero := 0
+	mc2 := &ModelConfig{
+		ID:          "test-zero",
+		Path:        "/models/test.gguf",
+		ContextSize: 4096,
+		CacheRAM:    &zero,
+	}
+	args2 := mc2.BuildArgs(nil, 8301)
+	foundZero := false
+	for i, a := range args2 {
+		if a == "--cache-ram" && i+1 < len(args2) && args2[i+1] == "0" {
+			foundZero = true
+			break
+		}
+	}
+	if !foundZero {
+		t.Fatalf("expected --cache-ram 0 in args, not found: %v", args2)
+	}
+
+	// Case 3: CacheRAM = 1024 → --cache-ram 1024
+	val := 1024
+	mc3 := &ModelConfig{
+		ID:          "test-val",
+		Path:        "/models/test.gguf",
+		ContextSize: 4096,
+		CacheRAM:    &val,
+	}
+	args3 := mc3.BuildArgs(nil, 8301)
+	foundVal := false
+	for i, a := range args3 {
+		if a == "--cache-ram" && i+1 < len(args3) && args3[i+1] == "1024" {
+			foundVal = true
+			break
+		}
+	}
+	if !foundVal {
+		t.Fatalf("expected --cache-ram 1024 in args, not found: %v", args3)
+	}
+}
+
 // TestResolveBinaryOverride tests that per-model Binary overrides backend binary.
 func TestResolveBinaryOverride(t *testing.T) {
 	mc := &ModelConfig{

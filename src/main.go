@@ -49,7 +49,7 @@ Config path resolution order:
 `
 
 // Version is the current llama-switch version. Bump on feature releases.
-const Version = "0.3.2"
+const Version = "0.3.3"
 
 func main() {
 	if len(os.Args) < 2 {

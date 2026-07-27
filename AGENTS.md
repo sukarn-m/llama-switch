@@ -101,8 +101,8 @@ The Chandra handler (`src/chandra_handler.go`) post-processes responses from the
 ## Configuration reference (`config/config.yaml`)
 
 - `server`: `host`, `port`, `backend_port_start/end`, `max_models`, `idle_timeout_minutes`, `health_timeout_seconds`, `sweep_interval_seconds`.
-- `backend`: `binary` (path to `llama-server`), `env` (notably `LD_LIBRARY_PATH` for CUDA libs), `common_args` (flags prepended to every model invocation), `workdir`, `nvidia_smi`.
-- `models`: list of `ModelConfig`. Lookup by `id` or `name` (`FindModel` matches `id` exactly, `name` case-insensitively). Each builds its llama-server args via `ModelConfig.BuildArgs`. Supports `mmproj` (multimodal), `tensor_split`, `ctx_checkpoints`, and freeform `extra_args`. Optional per-model override fields (`binary`, `args`, `health_path`, `env`) allow running non-llama-server backends — see [Per-model runtime override](#per-model-runtime-override).
+- `backend`: `binary` (path to `llama-server`), `env` (notably `LD_LIBRARY_PATH` for CUDA libs), `common_args` (flags prepended to every model invocation), `workdir`, `nvidia_smi`, `ctx_checkpoints` (global default for `--ctx-checkpoints`), `cache_ram` (global default for `--cache-ram`, in MiB).
+- `models`: list of `ModelConfig`. Lookup by `id` or `name` (`FindModel` matches `id` exactly, `name` case-insensitively). Each builds its llama-server args via `ModelConfig.BuildArgs`. Supports `mmproj` (multimodal), `tensor_split`, `ctx_checkpoints`, `cache_ram`, and freeform `extra_args`. Optional per-model override fields (`binary`, `args`, `health_path`, `env`) allow running non-llama-server backends — see [Per-model runtime override](#per-model-runtime-override).
 - Path expansion: `~` and `$VAR` are expanded in config values (`expand()`), including colon-separated `LD_LIBRARY_PATH`-style lists.
 
 **Defaults applied when fields are zero/empty:** `backend_port_start=8201`, `backend_port_end=8299`, `max_models=2`, `idle_timeout_minutes=60`, `health_timeout_seconds=180`, `sweep_interval_seconds=15`, `nvidia_smi="nvidia-smi"`.
@@ -152,7 +152,7 @@ journalctl --user -u llama-switch -f
 
 ## Common tasks for agents
 
-- **Add a new model:** add an entry under `models:` in `config/config.yaml`; run `./bin/llama-switch profile` so admission control has VRAM estimates.
+- **Add a new model:** add an entry under `models:` in `config/config.yaml`; run `./bin/llama-switch profile` so admission control has VRAM estimates. Set `cache_ram: 0` on models with no prefix reuse (OCR, one-shot) to avoid wasting system RAM on the host-memory prompt cache.
 - **Add a non-llama-server model:** set `binary`, `args` (with `{port}`), and optionally `health_path`/`env` on the model config. The rest of llama-switch handles it automatically.
 - **Add a new HTTP endpoint:** add a path branch in `ProxyServer.handle` (`src/proxy.go`) and a `handleXxx` method. Management/model-list endpoints return JSON; proxying goes through `handleProxy` → `forward`.
 - **Add a model handler:** implement the `ModelHandler` interface in a new `*_handler.go` file under `src/`, register it in `NewModelHandler()` (currently in `src/chandra_handler.go`). The handler intercepts responses in `forwardWithHandler`.
@@ -176,3 +176,4 @@ journalctl --user -u llama-switch -f
 - Remote profiling: `POST /admin/profile` (or `?force=true`) triggers profiling on the running service. The CLI `profile` command auto-detects a running service and delegates to this endpoint, streaming SSE output to stdout. Concurrent profiling requests are rejected.
 - The `loading` map registration in `EnsureLoaded` happens AFTER the capacity wait loop, not before. If it were registered first, `len(loading)` would count against `MaxModels` in `ensureCapacityLocked`, causing a deadlock when two goroutines wait for different models simultaneously.
 - `ensureCapacityLocked` adds +1 to `len(backends)+len(loading)` to account for the model being loaded (which hasn't been registered in `loading` yet).
+- Host-memory prompt cache (`--cache-ram`): llama-server b10142+ defaults to 8192 MiB of system RAM for a prompt cache that stores KV states of completed requests for prefix reuse. This is separate from VRAM and from `--ctx-checkpoints`. The `cache_ram` config field (backend-level global, per-model override) controls this. Set `cache_ram: 0` on models with no prefix reuse (OCR, one-shot models). The model-level field uses `*int` so that explicit `0` (disable) is distinguishable from unset (inherit backend default).

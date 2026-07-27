@@ -85,6 +85,7 @@ type ModelConfigSnapshot struct {
 	Devices        []string `json:"devices"`
 	TensorSplit    string   `json:"tensor_split"`
 	CtxCheckpoints int      `json:"ctx_checkpoints"`
+	CacheRAM       *int     `json:"cache_ram,omitempty"`
 	ExtraArgs      []string `json:"extra_args"`
 	CommonArgs     []string `json:"common_args"`
 	// Per-model runtime override fields (affect VRAM when set)
@@ -304,6 +305,7 @@ func (m *ModelConfig) Snapshot(commonArgs []string) ModelConfigSnapshot {
 		Devices:        m.Devices,
 		TensorSplit:    m.TensorSplit,
 		CtxCheckpoints: m.CtxCheckpoints,
+		CacheRAM:       m.CacheRAM,
 		ExtraArgs:      m.ExtraArgs,
 		CommonArgs:     commonArgs,
 		Binary:         m.Binary,
@@ -323,6 +325,14 @@ func (s ModelConfigSnapshot) Equal(other ModelConfigSnapshot) bool {
 		s.TensorSplit != other.TensorSplit ||
 		s.CtxCheckpoints != other.CtxCheckpoints ||
 		s.Binary != other.Binary {
+		return false
+	}
+	// CacheRAM is *int: nil = unset, 0 = explicitly disabled.
+	// Both unset → equal. One set, one not → not equal. Both set → compare values.
+	if (s.CacheRAM == nil) != (other.CacheRAM == nil) {
+		return false
+	}
+	if s.CacheRAM != nil && *s.CacheRAM != *other.CacheRAM {
 		return false
 	}
 	if !sliceEqual(s.Devices, other.Devices) {

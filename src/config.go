@@ -40,6 +40,7 @@ type BackendConfig struct {
 	Workdir        string            `yaml:"workdir"`
 	NvidiaSMI      string            `yaml:"nvidia_smi"`
 	CtxCheckpoints int               `yaml:"ctx_checkpoints"`
+	CacheRAM       int               `yaml:"cache_ram"`
 }
 
 type ModelConfig struct {
@@ -52,6 +53,7 @@ type ModelConfig struct {
 	Devices        []string `yaml:"devices"`
 	TensorSplit    string   `yaml:"tensor_split"`
 	CtxCheckpoints int      `yaml:"ctx_checkpoints"`
+	CacheRAM       *int     `yaml:"cache_ram"`
 	ExtraArgs      []string `yaml:"extra_args"`
 
 	// ── Per-model runtime override (for non-llama-server backends) ──
@@ -150,6 +152,18 @@ func LoadConfig(path string) (*Config, error) {
 		for i := range cfg.Models {
 			if cfg.Models[i].CtxCheckpoints == 0 {
 				cfg.Models[i].CtxCheckpoints = cfg.Backend.CtxCheckpoints
+			}
+		}
+	}
+
+	// Apply global cache_ram default to models that don't set their own.
+	// Uses *int so that an explicit 0 (disable) is distinguishable from
+	// unset (inherit). When the backend default is 0 (unset), models with
+	// no override get nothing — llama-server's own default (8192 MiB) applies.
+	if cfg.Backend.CacheRAM != 0 {
+		for i := range cfg.Models {
+			if cfg.Models[i].CacheRAM == nil {
+				cfg.Models[i].CacheRAM = &cfg.Backend.CacheRAM
 			}
 		}
 	}
@@ -253,6 +267,9 @@ func (m *ModelConfig) BuildArgs(common []string, port int) []string {
 	}
 	if m.CtxCheckpoints != 0 {
 		args = append(args, "--ctx-checkpoints", strconv.Itoa(m.CtxCheckpoints))
+	}
+	if m.CacheRAM != nil {
+		args = append(args, "--cache-ram", strconv.Itoa(*m.CacheRAM))
 	}
 
 	// Dynamic host/port (always loopback for backend)

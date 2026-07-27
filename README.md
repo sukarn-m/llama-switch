@@ -67,10 +67,12 @@ Key settings:
 | `server.profile_drain_seconds` | Drain timeout before profiling, seconds (default 60) |
 | `backend.binary` | Path to `llama-server` |
 | `backend.env.LD_LIBRARY_PATH` | CUDA library paths |
+| `backend.cache_ram` | Host-memory prompt cache limit in MiB (default: 8192 if unset; set 0 to disable) |
 | `models[].id` | Short routing ID (used in logs and internal tracking) |
 | `models[].name` | Display name (what clients see in API responses) |
 | `models[].path` | Path to `.gguf` file |
 | `models[].devices` | Which CUDA devices to use |
+| `models[].cache_ram` | Per-model override of `backend.cache_ram` (0 = disable for this model) |
 
 After configuring, profile each model's VRAM usage once so admission control has data to work with:
 
