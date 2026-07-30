@@ -103,9 +103,9 @@ The Chandra handler (`src/chandra_handler.go`) post-processes responses from the
 - `server`: `host`, `port`, `backend_port_start/end`, `max_models`, `idle_timeout_minutes`, `health_timeout_seconds`, `sweep_interval_seconds`.
 - `backend`: `binary` (path to `llama-server`), `env` (notably `LD_LIBRARY_PATH` for CUDA libs), `common_args` (flags prepended to every model invocation), `workdir`, `nvidia_smi`, `ctx_checkpoints` (global default for `--ctx-checkpoints`), `cache_ram` (global default for `--cache-ram`, in MiB).
 - `models`: list of `ModelConfig`. Lookup by `id` or `name` (`FindModel` matches `id` exactly, `name` case-insensitively). Each builds its llama-server args via `ModelConfig.BuildArgs`. Supports `mmproj` (multimodal), `tensor_split`, `ctx_checkpoints`, `cache_ram`, and freeform `extra_args`. Optional per-model override fields (`binary`, `args`, `health_path`, `env`) allow running non-llama-server backends — see [Per-model runtime override](#per-model-runtime-override).
-- Path expansion: `~` and `$VAR` are expanded in config values (`expand()`), including colon-separated `LD_LIBRARY_PATH`-style lists.
+- Path expansion: `~`, `~/...`, and `$VAR` are expanded in config values (`expand()`), including colon-separated `LD_LIBRARY_PATH`-style lists.
 
-**Defaults applied when fields are zero/empty:** `backend_port_start=8201`, `backend_port_end=8299`, `max_models=2`, `idle_timeout_minutes=60`, `health_timeout_seconds=180`, `sweep_interval_seconds=15`, `nvidia_smi="nvidia-smi"`.
+**Defaults applied when fields are zero/empty:** `backend_port_start=8201`, `backend_port_end=8299`, `max_models=2`, `idle_timeout_minutes=60`, `health_timeout_seconds=180`, `sweep_interval_seconds=15`, `queue_max_depth=64`, `queue_timeout_seconds=600`, `profile_drain_seconds=60`, `nvidia_smi="nvidia-smi"`. Validation rejects `server.port` overlapping the backend port range.
 
 ## Commands
 
@@ -113,7 +113,7 @@ The Chandra handler (`src/chandra_handler.go`) post-processes responses from the
 ./bin/llama-switch serve [config]    # start proxy (default if no command given)
 ./bin/llama-switch profile [config]  # load each model once, measure VRAM, save to config/vram-cache.json
 ./bin/llama-switch models [config]   # list configured models + VRAM estimates
-./bin/llama-switch status [config]   # query a running server's /v1/loaded  (note: wired in usage but dispatched via `serve` path; see main.go)
+./bin/llama-switch status [config]   # query a running server's /v1/loaded
 ./bin/llama-switch help
 ```
 
@@ -145,7 +145,7 @@ journalctl --user -u llama-switch -f
 - **Comment style:** section dividers use `// ── Name ──────` banners; exported functions carry doc comments; `Caller must hold <mu>` notes annotate lock contracts — respect these when editing.
 - **Locking:** `BackendManager.mu` guards the `backends` map and port allocator interactions during lifecycle. Methods suffixed `Locked` require the caller to hold the lock (e.g. `startBackendLocked`, `stopLocked`, `ensureCapacityLocked`, `evictLRULocked`). Preserve the double-checked-locking pattern in `EnsureLoaded` (RLock fast path → Lock slow path).
 - **Process output** from each backend is piped through `logPipe` and printed to stdout with a `[model-id]` prefix — keep this; it's how service logs are read.
-- **Streaming detection** in `forward()` is a naive string scan for `"stream":true` / `"stream": true`. If you touch request handling, be aware this is intentionally simple and does not fully parse JSON.
+- **Streaming detection** in `forward()` keys off the backend response's `Content-Type`: SSE responses (`text/event-stream`) are forwarded event-by-event via `streamSSE` (flush after each `\n\n`-delimited event); all other responses use a plain `io.Copy`.
 - **Errors during backend start** (port alloc fail, binary missing, health timeout) must release the port and clean up — mirror the cleanup in `startBackendLocked`.
 - **Config is authoritative.** `config/config.yaml` reflects a real deployment with specific GGUF paths, GPU topology, and a bind address. Treat it as live configuration, not an example template.
 - **Tests exist** in `src/` (per-model runtime override in `llama_switch_test.go`, Chandra OCR handler in `chandra_handler_test.go`, plus `http_proxy_test.go`, `inflight_test.go`, `findmodel_vram_test.go`). Run `go test ./...` to execute all tests; use `-short` to skip integration tests.
@@ -172,7 +172,7 @@ journalctl --user -u llama-switch -f
 - `config/config.yaml` contains absolute paths specific to the deployment machine; don't generalize them.
 - In-flight request tracking: each `Backend` has an atomic `inFlight` counter, incremented in `handleProxy` before forwarding and decremented via `defer`. Eviction (`evictLRULocked`), idle sweeping (`sweepIdle`), and explicit unload (`StopModel`) all skip backends with `InFlight() > 0` to avoid killing active requests.
 - Capacity queue: when `EnsureLoaded` can't evict (all backends in-flight), the caller releases the write lock and blocks on a channel (`capCh`) until a request completes and calls `SignalCapacity()`, or until the queue timeout (default 600s / 10 min). Requests for already-loaded models hit the fast path and never wait. Max queue depth is `queue_max_depth` (default 64); beyond that, new requests get an error. The queue is best-effort FIFO (goroutine scheduling order, not guaranteed).
-- Drain mode: `BackendManager.StartDraining()` sets an atomic flag that causes `EnsureLoaded` and `handleProxy` to return 503. Used during remote profiling. `WaitIdle(timeout)` blocks until all in-flight counters reach zero.
+- Drain mode: `BackendManager.StartDraining()` sets an atomic flag that causes `EnsureLoaded` and `handleProxy` to return 503. Used during remote profiling and shutdown: `Stop()` sets draining and closes `shutdownCh` BEFORE acquiring the write lock, so queue waiters wake and exit instead of starving the shutdown. `WaitIdle(timeout)` blocks until all in-flight counters reach zero.
 - Remote profiling: `POST /admin/profile` (or `?force=true`) triggers profiling on the running service. The CLI `profile` command auto-detects a running service and delegates to this endpoint, streaming SSE output to stdout. Concurrent profiling requests are rejected.
 - The `loading` map registration in `EnsureLoaded` happens AFTER the capacity wait loop, not before. If it were registered first, `len(loading)` would count against `MaxModels` in `ensureCapacityLocked`, causing a deadlock when two goroutines wait for different models simultaneously.
 - `ensureCapacityLocked` adds +1 to `len(backends)+len(loading)` to account for the model being loaded (which hasn't been registered in `loading` yet).

@@ -431,6 +431,65 @@ func TestAlreadyLoadedBypassesQueue(t *testing.T) {
 	}
 }
 
+// TestStopWakesLoadingWaiter verifies that Stop() wakes a goroutine
+// blocked on the loading cond var (waiting for another model's load to
+// finish) instead of deadlocking behind it. Regression test: previously
+// Stop() took bm.mu and iterated backends while the waiter held-and-
+// released mu in cond.Wait(), and the waiter was never signaled — both
+// sides hung forever.
+func TestStopWakesLoadingWaiter(t *testing.T) {
+	cfg := &Config{
+		Server: ServerConfig{
+			MaxModels:           1,
+			BackendPortStart:    18201,
+			BackendPortEnd:      18299,
+			QueueMaxDepth:       64,
+			QueueTimeoutSeconds: 30,
+		},
+		Models: []ModelConfig{{ID: "a", Name: "a", Path: "/dev/null"}},
+	}
+	bm := NewBackendManager(cfg, "", NewLogger())
+
+	// Simulate an in-progress load by another goroutine: register a
+	// loading cond for "a" without ever completing it.
+	bm.mu.Lock()
+	hangCond := sync.NewCond(&bm.mu)
+	bm.loading["a"] = hangCond
+	bm.mu.Unlock()
+
+	done := make(chan error, 1)
+	go func() {
+		_, err := bm.EnsureLoaded("a")
+		done <- err
+	}()
+
+	// Wait until the goroutine is parked on the loading cond: it must
+	// have observed the entry at least once. There's no direct probe,
+	// so give it a moment to reach cond.Wait().
+	time.Sleep(100 * time.Millisecond)
+
+	stopDone := make(chan struct{})
+	go func() {
+		bm.Stop()
+		close(stopDone)
+	}()
+
+	select {
+	case <-stopDone:
+	case <-time.After(5 * time.Second):
+		t.Fatal("Stop() deadlocked behind loading waiter")
+	}
+
+	select {
+	case err := <-done:
+		if err == nil {
+			t.Fatal("expected EnsureLoaded to error after Stop")
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("loading waiter not woken by Stop()")
+	}
+}
+
 func TestDrainMode(t *testing.T) {
 	cfg := &Config{
 		Server: ServerConfig{MaxModels: 1, BackendPortStart: 18201, BackendPortEnd: 18299,

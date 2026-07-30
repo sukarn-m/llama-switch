@@ -32,6 +32,7 @@ Key behaviours:
 - **Model handlers** — pluggable response post-processing for models that need it (e.g. Chandra 2 OCR: HTML-to-markdown conversion, Devanagari conjunct fixes) (see [Model handlers](#model-handlers))
 - **Stdout prefixing** — each backend's log output is prefixed with `[model-id]`
 - **OpenAI-compatible** — works with Open WebUI, opencode, agent frameworks, and anything that speaks the OpenAI Chat Completions API
+- **True SSE streaming** — token chunks are flushed per SSE event (not per fixed-size buffer), so clients see tokens as they're generated
 
 ## Getting started
 
@@ -65,6 +66,7 @@ Key settings:
 | `server.queue_max_depth` | Max requests queued when eviction blocked (default 64) |
 | `server.queue_timeout_seconds` | Max wait in capacity queue, seconds (default 600) |
 | `server.profile_drain_seconds` | Drain timeout before profiling, seconds (default 60) |
+| `server.port` | Must not overlap `backend_port_start`–`backend_port_end` (validated at startup) |
 | `backend.binary` | Path to `llama-server` |
 | `backend.env.LD_LIBRARY_PATH` | CUDA library paths |
 | `backend.cache_ram` | Host-memory prompt cache limit in MiB (default: 8192 if unset; set 0 to disable) |

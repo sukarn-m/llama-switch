@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"encoding/json"
@@ -415,22 +416,39 @@ func (ps *ProxyServer) forward(w http.ResponseWriter, r *http.Request, bodyBytes
 
 	w.WriteHeader(resp.StatusCode)
 
-	// Always flush after each write so SSE streaming works (HTTP-1 fix).
-	// The overhead for non-streaming responses is negligible.
+	// SSE streams token chunks that are typically far smaller than any read
+	// buffer. A fixed-size Read + Flush loop forwards data as it arrives,
+	// which is correct, but flushes per Read syscall rather than per event.
+	// Use a line scanner for SSE so every complete event (delimited by a
+	// blank line) is forwarded as one write+flush. Non-SSE responses
+	// (JSON bodies, downloads) use a plain 32 KB copy.
 	flusher, _ := w.(http.Flusher)
-	buf := make([]byte, 4096)
+	if flusher != nil && strings.Contains(resp.Header.Get("Content-Type"), "text/event-stream") {
+		streamSSE(w, resp.Body, flusher)
+		return
+	}
+	io.Copy(w, resp.Body) // client disconnect aborts via write error
+}
+
+// streamSSE copies an SSE stream from src to w line by line, flushing
+// after every blank line (end of an SSE event). Trailing partial data is
+// flushed when the stream ends. Returns on client write error.
+func streamSSE(w http.ResponseWriter, src io.Reader, flusher http.Flusher) {
+	br := bufio.NewReaderSize(src, 4096)
 	for {
-		n, err := resp.Body.Read(buf)
-		if n > 0 {
-			if _, werr := w.Write(buf[:n]); werr != nil {
+		chunk, err := br.ReadString('\n')
+		if chunk != "" {
+			if _, werr := io.WriteString(w, chunk); werr != nil {
 				return // client disconnected
 			}
-			if flusher != nil {
+			// A blank line terminates an SSE event.
+			if chunk == "\n" || chunk == "\r\n" {
 				flusher.Flush()
 			}
 		}
 		if err != nil {
-			break
+			flusher.Flush() // flush any trailing partial line
+			return
 		}
 	}
 }

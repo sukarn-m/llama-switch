@@ -118,6 +118,9 @@ func (bm *BackendManager) Start() {
 	go bm.idleSweeper()
 }
 
+// Stop shuts down all backends. It signals shutdown first so waitHealth
+// aborts, wakes any goroutines blocked in EnsureLoaded's loading cond or
+// capacity queue (they must not leak), then stops all backends.
 func (bm *BackendManager) Stop() {
 	bm.sweeperOnce.Do(func() {
 		close(bm.shutdownCh)
@@ -125,6 +128,14 @@ func (bm *BackendManager) Stop() {
 	})
 	bm.mu.Lock()
 	defer bm.mu.Unlock()
+	// Wake loading-cond waiters: they re-check backends/loading, find
+	// nothing loading, and proceed to the drain check below.
+	for id, cond := range bm.loading {
+		delete(bm.loading, id)
+		cond.Broadcast()
+	}
+	// Wake capacity-queue waiters blocked on capCh.
+	bm.signalCapacityLocked()
 	for id, b := range bm.backends {
 		bm.stopLocked(id, b)
 	}
@@ -369,15 +380,6 @@ func (bm *BackendManager) EnsureLoaded(modelID string) (*Backend, error) {
 		}
 
 		// Check if another goroutine is already loading this model
-		if cond, ok := bm.loading[canonicalID]; ok {
-			bm.mu.RUnlock()
-			bm.mu.Lock()
-			for bm.loading[canonicalID] == cond {
-				cond.Wait()
-			}
-			bm.mu.Unlock()
-			continue // re-check fast path
-		}
 		bm.mu.RUnlock()
 
 		// Slow path: acquire write lock and load
@@ -388,6 +390,15 @@ func (bm *BackendManager) EnsureLoaded(modelID string) (*Backend, error) {
 			b.InFlightAdd()
 			bm.mu.Unlock()
 			return b, nil
+		}
+
+		// Check loading map under write lock (concurrent map read/write safe)
+		if cond, ok := bm.loading[canonicalID]; ok {
+			for bm.loading[canonicalID] == cond {
+				cond.Wait()
+			}
+			bm.mu.Unlock()
+			continue // re-check fast path
 		}
 
 		// Reject new loads during drain mode (profiling, maintenance)
@@ -441,9 +452,13 @@ func (bm *BackendManager) EnsureLoaded(modelID string) (*Backend, error) {
 			capCh := bm.capCh
 			bm.mu.Unlock()
 
+			// Use a stoppable timer so woken waiters don't leak a timer
+			// goroutine for the full queue timeout (default 600 s).
+			t := time.NewTimer(time.Until(deadline))
 			select {
 			case <-capCh:
-			case <-time.After(time.Until(deadline)):
+				t.Stop()
+			case <-t.C:
 			}
 
 			atomic.AddInt64(&bm.queueDepth, -1)
