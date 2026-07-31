@@ -14,6 +14,7 @@ server:
   queue_max_depth: 64           # max requests queued when eviction blocked
   queue_timeout_seconds: 600   # max wait in capacity queue (10 min)
   profile_drain_seconds: 60    # drain timeout before profiling
+  shutdown_drain_seconds: 120  # drain timeout before stopping backends on SIGTERM
 
 backend:
   binary: "~/sources/llama.cpp-cuda/llama-server"

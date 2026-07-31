@@ -49,7 +49,7 @@ Config path resolution order:
 `
 
 // Version is the current llama-switch version. Bump on feature releases.
-const Version = "0.3.3"
+const Version = "0.3.4"
 
 func main() {
 	if len(os.Args) < 2 {
@@ -134,13 +134,20 @@ func serve(configPath string) {
 
 	ps := NewProxyServer(cfg, bm)
 
-	// Graceful shutdown: signal handler initiates shutdown, main
-	// goroutine waits for ListenAndServe to return after draining.
+	// Graceful shutdown: on signal, enter drain mode (reject new requests),
+	// wait for in-flight requests to finish, then stop backends and close
+	// the HTTP listener. systemd's TimeoutStopSec must be >= shutdown_drain_seconds.
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
 	go func() {
 		sig := <-sigCh
-		logger.Printf("received signal %v, shutting down...", sig)
+		logger.Printf("received signal %v, draining active requests...", sig)
+		bm.StartDraining()
+		drainTimeout := time.Duration(cfg.Server.ShutdownDrainSeconds) * time.Second
+		if err := bm.WaitIdle(drainTimeout); err != nil {
+			logger.Printf("drain timeout exceeded, forcibly stopping: %v", err)
+		}
+		logger.Printf("stopping backends...")
 		bm.Stop()
 		ps.Shutdown()
 	}()

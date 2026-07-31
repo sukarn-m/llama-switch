@@ -16,7 +16,7 @@ Restart=on-failure
 RestartSec=5s
 KillMode=mixed
 TimeoutStartSec=1h
-TimeoutStopSec=30s
+TimeoutStopSec=180s
 
 [Install]
 WantedBy=default.target

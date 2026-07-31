@@ -125,13 +125,21 @@ func (ps *ProxyServer) handleV1Models(w http.ResponseWriter, r *http.Request) {
 		if loaded[m.ID] {
 			statusVal = "loaded"
 		}
-		models = append(models, map[string]any{
+		entry := map[string]any{
 			"id":       m.Name,
 			"object":   "model",
 			"created":  0,
 			"owned_by": "llama-switch",
 			"status":   map[string]any{"value": statusVal},
-		})
+		}
+		if m.ContextSize > 0 {
+			parallel := m.Parallel
+			if parallel == 0 {
+				parallel = 1
+			}
+			entry["context_length"] = m.ContextSize / parallel
+		}
+		models = append(models, entry)
 	}
 	json.NewEncoder(w).Encode(map[string]any{
 		"object": "list",
@@ -152,6 +160,13 @@ func (ps *ProxyServer) handleModels(w http.ResponseWriter, r *http.Request) {
 			"id":     m.Name,
 			"path":   expand(m.Path),
 			"status": map[string]any{"value": statusVal},
+		}
+		if m.ContextSize > 0 {
+			parallel := m.Parallel
+			if parallel == 0 {
+				parallel = 1
+			}
+			entry["context_length"] = m.ContextSize / parallel
 		}
 		data = append(data, entry)
 	}

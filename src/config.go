@@ -28,9 +28,10 @@ type ServerConfig struct {
 	IdleTimeoutMinutes   int    `yaml:"idle_timeout_minutes"`
 	HealthTimeoutSeconds int    `yaml:"health_timeout_seconds"`
 	SweepIntervalSeconds int    `yaml:"sweep_interval_seconds"`
-	QueueMaxDepth        int    `yaml:"queue_max_depth"`
-	QueueTimeoutSeconds  int    `yaml:"queue_timeout_seconds"`
-	ProfileDrainSeconds  int    `yaml:"profile_drain_seconds"`
+	QueueMaxDepth         int    `yaml:"queue_max_depth"`
+	QueueTimeoutSeconds   int    `yaml:"queue_timeout_seconds"`
+	ProfileDrainSeconds   int    `yaml:"profile_drain_seconds"`
+	ShutdownDrainSeconds  int    `yaml:"shutdown_drain_seconds"`
 }
 
 type BackendConfig struct {
@@ -142,6 +143,9 @@ func LoadConfig(path string) (*Config, error) {
 	}
 	if cfg.Server.ProfileDrainSeconds == 0 {
 		cfg.Server.ProfileDrainSeconds = 60
+	}
+	if cfg.Server.ShutdownDrainSeconds == 0 {
+		cfg.Server.ShutdownDrainSeconds = 120
 	}
 	if cfg.Backend.NvidiaSMI == "" {
 		cfg.Backend.NvidiaSMI = "nvidia-smi"
