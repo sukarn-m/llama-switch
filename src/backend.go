@@ -43,7 +43,8 @@ type BackendManager struct {
 	vramCache       VRAMCache
 	vramCacheP      string
 	backends        map[string]*Backend   // keyed by canonical model ID
-	loading         map[string]*sync.Cond // model ID -> condition variable for in-progress loads
+	loading         map[string]*sync.Cond // model ID -> condition variable for in-progress loads (includes requests still queued for capacity)
+	reserved        map[string]bool       // model IDs that have been admitted (or are mid-eviction on their own behalf) and WILL spawn; only these count toward MaxModels/pending VRAM
 	mu              sync.RWMutex
 	portAlloc       portAllocator
 	logger          *CondLogger
@@ -103,6 +104,7 @@ func NewBackendManager(cfg *Config, configPath string, logger *CondLogger) *Back
 		configPath:  configPath,
 		backends:    make(map[string]*Backend),
 		loading:     make(map[string]*sync.Cond),
+		reserved:    make(map[string]bool),
 		portAlloc:   newPortAllocator(cfg.Server.BackendPortStart, cfg.Server.BackendPortEnd),
 		logger:      logger,
 		sweeperStop: make(chan struct{}),
@@ -132,6 +134,7 @@ func (bm *BackendManager) Stop() {
 	// nothing loading, and proceed to the drain check below.
 	for id, cond := range bm.loading {
 		delete(bm.loading, id)
+		delete(bm.reserved, id)
 		cond.Broadcast()
 	}
 	// Wake capacity-queue waiters blocked on capCh.
@@ -407,15 +410,16 @@ func (bm *BackendManager) EnsureLoaded(modelID string) (*Backend, error) {
 			return nil, fmt.Errorf("service is draining (profiling or maintenance in progress)")
 		}
 
-		// Register as loading BEFORE ensureCapacityLocked so other
-		// goroutines account for our pending VRAM during the eviction
-		// sleep window (lines 596-598 in ensureCapacityLocked release
-		// and re-acquire the lock). Without this, two models can race
-		// past the VRAM check simultaneously.
+		// Register as loading BEFORE ensureCapacityLocked so duplicate
+		// requests for this model wait on loadCond. This does NOT reserve
+		// VRAM or a MaxModels slot: ensureCapacityLocked sets bm.reserved
+		// only once this model starts evicting for itself or is admitted,
+		// so requests that are merely queued never block each other.
 		loadCond := sync.NewCond(&bm.mu)
 		bm.loading[canonicalID] = loadCond
 		deleteLoading := func() {
 			delete(bm.loading, canonicalID)
+			delete(bm.reserved, canonicalID)
 			loadCond.Broadcast()
 			bm.signalCapacityLocked()
 		}
@@ -519,58 +523,95 @@ func (bm *BackendManager) EnsureLoaded(modelID string) (*Backend, error) {
 }
 
 // ensureCapacityLocked checks model count limits and VRAM, evicting
-// LRU models as needed. Counts both loaded backends and in-flight loads
-// toward the MaxModels budget to prevent soft limit violations.
-// Caller must hold bm.mu.
-func (bm *BackendManager) ensureCapacityLocked(mc *ModelConfig) error {
-	// 1. Count limit: evict if loaded + loading would exceed MaxModels.
-	// The caller is already registered in bm.loading (done in EnsureLoaded
-	// before calling us), so len(loading) already includes this model.
-	// We add 0 (not 1) since we're already counted.
-	for len(bm.backends)+len(bm.loading) > bm.cfg.Server.MaxModels {
+// LRU models as needed. Caller must hold bm.mu.
+//
+// Reservations: bm.loading contains every request that is working on (or
+// queued for) a load of a given model, but only models in bm.reserved count
+// toward the MaxModels budget and the pending-VRAM total. A model becomes
+// reserved the moment it evicts something on its own behalf (so a concurrent
+// admission check cannot grab the VRAM during the unlocked eviction sleep) or
+// is admitted; the reservation is dropped again if this function returns an
+// error (the caller goes back to waiting) and by EnsureLoaded's deleteLoading
+// once the load finishes. Merely queued requests hold no reservation.
+//
+// Counting queued requests as pending (the earlier behaviour) made two
+// different models waiting behind a busy backend each treat the other as
+// "about to consume VRAM". When the busy backend finished and was evicted,
+// both reported "waiting for 1 loading model(s)", neither spawned, and
+// nothing signalled capacity again: the GPU sat empty until queue timeout.
+func (bm *BackendManager) ensureCapacityLocked(mc *ModelConfig) (err error) {
+	defer func() {
+		if err != nil {
+			delete(bm.reserved, mc.ID)
+		}
+	}()
+
+	// othersReserved counts reservations held by models other than mc that
+	// are not yet in the backends map.
+	othersReserved := func() int {
+		n := 0
+		for id := range bm.reserved {
+			if id == mc.ID {
+				continue
+			}
+			if _, up := bm.backends[id]; up {
+				continue
+			}
+			n++
+		}
+		return n
+	}
+
+	// 1. Count limit: evict if loaded + reserved + this model would exceed MaxModels.
+	for len(bm.backends)+othersReserved()+1 > bm.cfg.Server.MaxModels {
+		bm.reserved[mc.ID] = true
 		if err := bm.evictLRULocked(); err != nil {
 			return fmt.Errorf("cannot make room for %s: %w", mc.ID, err)
 		}
 	}
 
 	// 2. VRAM limit: evict LRU until estimated VRAM fits on each target GPU.
-	// Account for VRAM that will be consumed by models currently loading
-	// (they haven't hit nvidia-smi yet but will shortly).
+	// Account for VRAM that will be consumed by models that have been
+	// admitted but haven't hit nvidia-smi yet.
 	needed := vramEstimate(bm.vramCache, mc, bm.cfg.Backend.CommonArgs)
 	if needed > 0 {
-		// Compute pending VRAM from loading models so we don't admit
-		// two big models simultaneously.
-		pendingPerGPU := make([]int, 0)
-		for loadID := range bm.loading {
-			if loadID == mc.ID {
-				continue // skip ourselves; we're checking if WE fit
-			}
-			lmc := bm.cfg.FindModel(loadID)
-			if lmc == nil {
-				continue
-			}
-			pg := vramEstimatePerGPU(bm.vramCache, lmc, bm.cfg.Backend.CommonArgs)
-			if pg == nil {
-				// No per-GPU data; use aggregate as fallback
-				agg := vramEstimate(bm.vramCache, lmc, bm.cfg.Backend.CommonArgs)
-				if agg > 0 {
-					if len(pendingPerGPU) == 0 {
-						pendingPerGPU = []int{0}
-					}
-					pendingPerGPU[0] += agg
-				}
-				continue
-			}
-			for len(pendingPerGPU) < len(pg) {
-				pendingPerGPU = append(pendingPerGPU, 0)
-			}
-			for i, v := range pg {
-				pendingPerGPU[i] += v
-			}
-		}
 		for {
-			stats, err := queryVRAM(bm.cfg.Backend.NvidiaSMI)
-			if err != nil {
+			// Recompute pending each iteration: reservations change while
+			// the lock is released during the eviction sleep below.
+			pendingPerGPU := make([]int, 0)
+			for loadID := range bm.reserved {
+				if loadID == mc.ID {
+					continue // skip ourselves; we're checking if WE fit
+				}
+				if _, up := bm.backends[loadID]; up {
+					continue // already running; nvidia-smi reflects it
+				}
+				lmc := bm.cfg.FindModel(loadID)
+				if lmc == nil {
+					continue
+				}
+				pg := vramEstimatePerGPU(bm.vramCache, lmc, bm.cfg.Backend.CommonArgs)
+				if pg == nil {
+					// No per-GPU data; use aggregate as fallback
+					agg := vramEstimate(bm.vramCache, lmc, bm.cfg.Backend.CommonArgs)
+					if agg > 0 {
+						if len(pendingPerGPU) == 0 {
+							pendingPerGPU = []int{0}
+						}
+						pendingPerGPU[0] += agg
+					}
+					continue
+				}
+				for len(pendingPerGPU) < len(pg) {
+					pendingPerGPU = append(pendingPerGPU, 0)
+				}
+				for i, v := range pg {
+					pendingPerGPU[i] += v
+				}
+			}
+
+			stats, qerr := queryVRAM(bm.cfg.Backend.NvidiaSMI)
+			if qerr != nil {
 				break // can't query VRAM, proceed optimistically
 			}
 			// Adjust free VRAM by subtracting pending loads
@@ -600,23 +641,21 @@ func (bm *BackendManager) ensureCapacityLocked(mc *ModelConfig) error {
 			if vramFitsPerGPU(stats, mc, bm.vramCache, bm.cfg.Backend.CommonArgs, headroom) {
 				break
 			}
-			if len(bm.backends) == 0 && len(bm.loading) == 0 {
-				break // nothing left to evict and nothing loading; try anyway
-			}
 			if len(bm.backends) == 0 {
-				// Can't evict. If OTHER models are loading (not us),
-				// wait for them — their VRAM isn't reflected in
-				// nvidia-smi yet. If we're the only one loading,
-				// there's nothing to wait for; break and try loading.
-				otherLoading := len(bm.loading)
-				if _, ok := bm.loading[mc.ID]; ok {
-					otherLoading--
-				}
-				if otherLoading > 0 {
-					return fmt.Errorf("waiting for %d loading model(s) to free VRAM", otherLoading)
+				// Nothing left to evict. If another model holds a
+				// reservation, its VRAM isn't reflected in nvidia-smi yet:
+				// wait for it (it will signal capacity when its load
+				// completes). Otherwise there's nothing to wait for; break
+				// and try loading anyway.
+				if n := othersReserved(); n > 0 {
+					return fmt.Errorf("waiting for %d loading model(s) to free VRAM", n)
 				}
 				break
 			}
+			// Reserve before evicting: the lock is released during the
+			// sleep below and a concurrent admission check must see that
+			// the VRAM we are freeing is spoken for.
+			bm.reserved[mc.ID] = true
 			if err := bm.evictLRULocked(); err != nil {
 				return err
 			}
@@ -627,6 +666,7 @@ func (bm *BackendManager) ensureCapacityLocked(mc *ModelConfig) error {
 		}
 	}
 
+	bm.reserved[mc.ID] = true
 	return nil
 }
 

@@ -1,6 +1,7 @@
 package main
 
 import (
+	"os"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -561,5 +562,94 @@ func TestEvictAll(t *testing.T) {
 
 	if count != 0 {
 		t.Fatalf("expected 0 backends after evictAllLocked, got %d", count)
+	}
+}
+
+// TestCapacityQueueTwoWaitersDoNotDeadlock reproduces a livelock seen in
+// production: backend A is busy and holds most of the VRAM. Requests for two
+// OTHER models (B, C) queue behind it, and each is registered in bm.loading.
+// B and C cannot both fit, so each one's admission check subtracts the other's
+// "pending" VRAM. When A finishes and is evicted, B sees C as pending and
+// reports "waiting for 1 loading model(s)", while C sees B as pending and does
+// the same. Neither actually spawns a process, nothing signals capacity again,
+// and the GPU sits empty until the queue timeout (600 s by default).
+func TestCapacityQueueTwoWaitersDoNotDeadlock(t *testing.T) {
+	dir := t.TempDir()
+	usedFile := dir + "/used"
+	if err := os.WriteFile(usedFile, []byte("20000"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	smi := dir + "/fake-smi"
+	script := "#!/bin/sh\nu=$(cat " + usedFile + ")\necho \"24000, $u, $((24000-u))\"\n"
+	if err := os.WriteFile(smi, []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	cfg := &Config{
+		Server: ServerConfig{
+			MaxModels:           3,
+			BackendPortStart:    18201,
+			BackendPortEnd:      18299,
+			QueueMaxDepth:       64,
+			QueueTimeoutSeconds: 4,
+		},
+		Backend: BackendConfig{NvidiaSMI: smi},
+		Models: []ModelConfig{
+			{ID: "a", Name: "a", Path: "/dev/null", Devices: []string{"CUDA0"}},
+			// Binary does not exist: a model that is admitted fails fast in
+			// startBackendLocked instead of hanging in the capacity queue.
+			{ID: "b", Name: "b", Path: "/dev/null", Devices: []string{"CUDA0"}, Binary: "/nonexistent/llama-server"},
+			{ID: "c", Name: "c", Path: "/dev/null", Devices: []string{"CUDA0"}, Binary: "/nonexistent/llama-server"},
+		},
+	}
+	bm := NewBackendManager(cfg, "", NewLogger())
+	for _, id := range []string{"a", "b", "c"} {
+		mc := cfg.FindModel(id)
+		bm.vramCache[id] = CacheEntry{Vram: 15000, GPUVRAM: []int{15000}, Config: mc.Snapshot(cfg.Backend.CommonArgs)}
+	}
+
+	a := &Backend{ID: "a", Port: 18201}
+	a.setLastRequest(time.Now())
+	a.InFlightAdd()
+	bm.mu.Lock()
+	bm.backends["a"] = a
+	bm.mu.Unlock()
+
+	type result struct {
+		id  string
+		err error
+	}
+	results := make(chan result, 2)
+	for _, id := range []string{"b", "c"} {
+		id := id
+		go func() {
+			_, err := bm.EnsureLoaded(id)
+			results <- result{id, err}
+		}()
+	}
+
+	// Wait until both are parked in the capacity queue.
+	deadline := time.Now().Add(3 * time.Second)
+	for atomic.LoadInt64(&bm.queueDepth) != 2 && time.Now().Before(deadline) {
+		time.Sleep(5 * time.Millisecond)
+	}
+	if d := atomic.LoadInt64(&bm.queueDepth); d != 2 {
+		t.Fatalf("expected both waiters queued, depth=%d", d)
+	}
+
+	// A's request finishes (what handleProxy's defer does) and A's VRAM is freed.
+	os.WriteFile(usedFile, []byte("0"), 0o644)
+	a.InFlightDone()
+	bm.SignalCapacity()
+
+	// At least one waiter must be admitted (and fail fast on the missing
+	// binary) well before the 4 s queue timeout.
+	select {
+	case r := <-results:
+		if r.err != nil && strings.Contains(r.err.Error(), "queue timeout") {
+			t.Fatalf("waiter %s hit the queue timeout: capacity waiters deadlocked on each other after the busy backend finished (%v)", r.id, r.err)
+		}
+	case <-time.After(2500 * time.Millisecond):
+		t.Fatal("neither waiter was admitted after the busy backend finished: capacity waiters deadlocked on each other")
 	}
 }
