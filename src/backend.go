@@ -24,7 +24,8 @@ type Backend struct {
 	doneCh    chan struct{}
 	mu        sync.Mutex
 	lastReq   time.Time
-	inFlight  int64 // atomic; number of active proxied requests
+	inFlight  int64  // atomic; number of active proxied requests
+	apiKey    string // backend API key, if the backend requires one
 }
 
 // InFlightAdd increments the in-flight request counter.
@@ -56,6 +57,7 @@ type BackendManager struct {
 	draining        atomic.Bool   // when true, reject new load requests
 	profiling       atomic.Bool   // when true, profiling is in progress (prevents concurrent profiling)
 	skipAutoProfile atomic.Bool   // when true, startBackendLocked skips auto-profiling
+	backendKey      string        // API key the backends require; auto-generated when not configured
 }
 
 type portAllocator struct {
@@ -99,6 +101,15 @@ func (pa *portAllocator) release(p int) {
 // ── Manager init ─────────────────────────────
 
 func NewBackendManager(cfg *Config, configPath string, logger *CondLogger) *BackendManager {
+	// The backends listen on loopback, but any local process could still
+	// reach them and bypass the proxy's routing and VRAM admission
+	// control. Giving the backends an API key that only the proxy knows
+	// closes that. When no key is configured, one is generated for this
+	// process, so the protection is on by default.
+	backendKey := cfg.Backend.APIKey
+	if backendKey == "" {
+		backendKey = generateKey()
+	}
 	bm := &BackendManager{
 		cfg:         cfg,
 		configPath:  configPath,
@@ -109,6 +120,7 @@ func NewBackendManager(cfg *Config, configPath string, logger *CondLogger) *Back
 		logger:      logger,
 		sweeperStop: make(chan struct{}),
 		shutdownCh:  make(chan struct{}),
+		backendKey:  backendKey,
 	}
 	bm.vramCacheP = vramCachePath(cfg, configPath)
 	bm.vramCache = LoadVRAMCache(bm.vramCacheP)
@@ -713,8 +725,29 @@ func (bm *BackendManager) startBackendLocked(mc *ModelConfig) (*Backend, error) 
 	}
 
 	args := mc.BuildArgs(bm.cfg.Backend.CommonArgs, port)
+
+	// Give the backend an API key so that only the proxy can drive it.
+	// Without this, any local process could talk to the backend's
+	// loopback port directly, bypassing the proxy's model routing and
+	// VRAM admission control.
+	//
+	// The key is passed via the LLAMA_API_KEY environment variable rather
+	// than --api-key on the command line: argv is world-readable through
+	// ps, while a process environment is readable only by its owner.
+	// Custom-binary models are left alone — they may not support the flag.
+	backendKey := ""
+	if mc.runsLlamaServer() {
+		backendKey = bm.backendKey
+	}
+
 	cmd := exec.Command(binPath, args...)
 	cmd.Env = mc.BuildModelEnv(&bm.cfg.Backend)
+	if mc.runsLlamaServer() {
+		// Always set the variable explicitly, even when empty: an
+		// inherited LLAMA_API_KEY would otherwise give the backend a key
+		// the proxy does not know, and every request would be rejected.
+		cmd.Env = setEnv(cmd.Env, "LLAMA_API_KEY", backendKey)
+	}
 
 	if wd := expand(bm.cfg.Backend.Workdir); wd != "" {
 		if abs, err := filepath.Abs(wd); err == nil {
@@ -733,6 +766,7 @@ func (bm *BackendManager) startBackendLocked(mc *ModelConfig) (*Backend, error) 
 		cmd:       cmd,
 		logPrefix: fmt.Sprintf("[%s]", mc.ID),
 		doneCh:    make(chan struct{}),
+		apiKey:    backendKey,
 	}
 	b.setLastRequest(time.Now())
 
@@ -772,7 +806,7 @@ func (bm *BackendManager) startBackendLocked(mc *ModelConfig) (*Backend, error) 
 	timeout := time.Duration(bm.cfg.Server.HealthTimeoutSeconds) * time.Second
 	bm.mu.Unlock()
 
-	err = bm.waitHealth(b.doneCh, bm.shutdownCh, port, mc.HealthEndpoint(), timeout)
+	err = bm.waitHealth(b.doneCh, bm.shutdownCh, port, mc.HealthEndpoint(), timeout, backendKey)
 
 	bm.mu.Lock()
 
@@ -906,7 +940,11 @@ func (bm *BackendManager) IsLoaded(id string) bool {
 
 // waitHealth polls the backend's health endpoint until it responds 200,
 // the timeout expires, or shutdownCh is closed. Does not require bm.mu.
-func (bm *BackendManager) waitHealth(doneCh, shutdownCh chan struct{}, port int, healthPath string, timeout time.Duration) error {
+//
+// When the backend requires an API key, the key is sent: llama-server
+// exempts /health from key validation, but a custom health_path may not
+// be exempt, and the check must work either way.
+func (bm *BackendManager) waitHealth(doneCh, shutdownCh chan struct{}, port int, healthPath string, timeout time.Duration, apiKey string) error {
 	url := fmt.Sprintf("http://127.0.0.1:%d%s", port, healthPath)
 	client := &http.Client{Timeout: 5 * time.Second}
 	deadline := time.Now().Add(timeout)
@@ -920,7 +958,14 @@ func (bm *BackendManager) waitHealth(doneCh, shutdownCh chan struct{}, port int,
 		default:
 		}
 
-		resp, err := client.Get(url)
+		req, err := http.NewRequest("GET", url, nil)
+		if err != nil {
+			return fmt.Errorf("invalid health URL %q: %w", url, err)
+		}
+		if apiKey != "" {
+			req.Header.Set("Authorization", "Bearer "+apiKey)
+		}
+		resp, err := client.Do(req)
 		if err == nil {
 			resp.Body.Close()
 			if resp.StatusCode == 200 {

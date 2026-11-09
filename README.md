@@ -76,6 +76,46 @@ Key settings:
 | `models[].devices` | Which CUDA devices to use |
 | `models[].cache_ram` | Per-model override of `backend.cache_ram` (0 = disable for this model) |
 
+### Security
+
+The proxy is the only client of `llama-server`, so it owns the security
+boundary. Four controls are enforced there:
+
+**CORS.** The proxy decides which browser origins may call it
+(`server.cors_allow_origins`) and strips the backend's own
+`Access-Control-*` response headers, so a backend started with
+`--cors-origins *` cannot widen the policy. Preflight (`OPTIONS`) requests
+are answered by the proxy and never forwarded. Entries are exact origins
+(`https://app.example`); the special values `localhost`, `*` and `none`
+are also accepted. Non-browser clients (curl, Hermes, opencode, Open
+WebUI's server) send no `Origin` header and are unaffected.
+
+**CSRF.** A state-changing request (`POST`, `PUT`, `DELETE`) that carries
+an `Origin` header from a browser is rejected unless that origin is
+allow-listed. This protects `/models/load`, `/models/unload` and
+`/admin/profile` against cross-site requests from a page the user happens
+to have open.
+
+**Backend authentication.** The backends listen on loopback, but any local
+process could still reach them and bypass the proxy's routing and VRAM
+admission control. Each backend is therefore given an API key
+(`backend.api_key`; generated automatically when unset) that only the proxy
+knows. The key is passed to `llama-server` via `LLAMA_API_KEY` in the
+process environment rather than on the command line, so it does not show up
+in `ps`.
+
+**Path allow-list.** Only known inference endpoints are forwarded to a
+backend. `llama.cpp`'s administrative surface — `/props`, `/slots`,
+`/lora-adapters`, `/cors-proxy`, `/tools`, `/metrics` — is not reachable
+through the proxy. Override with `server.forward_paths` if you need
+something else.
+
+Client-facing authentication is optional and off by default: set
+`server.api_key` to require `Authorization: Bearer <key>` (or
+`X-Api-Key: <key>`) on every endpoint except `/health`. The value may be
+written as `$VAR` so it can live in the environment instead of the config
+file.
+
 After configuring, profile each model's VRAM usage once so admission control has data to work with:
 
 ```bash

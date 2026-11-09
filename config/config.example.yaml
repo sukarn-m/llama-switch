@@ -16,6 +16,28 @@ server:
   profile_drain_seconds: 60    # drain timeout before profiling
   shutdown_drain_seconds: 120  # drain timeout before stopping backends on SIGTERM
 
+  # ── Security ──────────────────────────────────────────────────────
+  # API key required on every endpoint except /health. Clients send it as
+  # "Authorization: Bearer <key>" or "X-Api-Key: <key>". Leave empty to
+  # disable client authentication. $VAR is expanded, so the key can live
+  # in the environment instead of this file.
+  api_key: ""
+
+  # Browser origins allowed to call the proxy. Entries are exact origins
+  # ("https://app.example"); "localhost" allows any localhost origin;
+  # "*" allows any origin; "none" allows none. An empty list allows no
+  # browser origin at all — non-browser clients (curl, Open WebUI's
+  # server, opencode, Hermes) send no Origin header and are unaffected.
+  cors_allow_origins: []
+  cors_allow_credentials: false
+  cors_preflight_max_age: 600
+
+  # Backend endpoints the proxy will forward. Empty uses the built-in list
+  # of inference endpoints only; llama.cpp's administrative surface
+  # (/props, /slots, /lora-adapters, /cors-proxy, /tools) is never
+  # reachable through the proxy.
+  forward_paths: []
+
 backend:
   binary: "~/sources/llama.cpp-cuda/llama-server"
   env:
@@ -32,6 +54,12 @@ backend:
   nvidia_smi: "nvidia-smi"
   ctx_checkpoints: 4
   cache_ram: 1024  # host-memory prompt cache limit in MiB (0 = disable)
+
+  # API key the backends require. The proxy passes it to llama-server via
+  # LLAMA_API_KEY and sends it on every request, so no other local
+  # process can drive a backend directly and bypass the proxy's routing
+  # and VRAM admission control. Leave empty to disable.
+  api_key: ""
 
 models:
   - id: example-model

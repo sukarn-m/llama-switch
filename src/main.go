@@ -198,7 +198,7 @@ func profile(configPath string) {
 	// If a running service is detected, delegate to it
 	addr := fmt.Sprintf("%s:%d", cfg.Server.Host, cfg.Server.Port)
 	if isServiceRunning(addr) {
-		runRemoteProfile(addr)
+		runRemoteProfile(addr, cfg.Server.APIKey)
 		return
 	}
 
@@ -230,7 +230,7 @@ func isServiceRunning(addr string) bool {
 
 // runRemoteProfile sends a profiling request to a running service and
 // streams SSE progress to stdout.
-func runRemoteProfile(addr string) {
+func runRemoteProfile(addr string, apiKey string) {
 	fmt.Printf("Detected running llama-switch at %s — requesting remote profile...\n\n", addr)
 
 	url := fmt.Sprintf("http://%s/admin/profile", addr)
@@ -238,7 +238,15 @@ func runRemoteProfile(addr string) {
 		url += "?force=true"
 	}
 
-	resp, err := http.Post(url, "application/json", bytes.NewReader(nil))
+	req, err := http.NewRequest("POST", url, bytes.NewReader(nil))
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "failed to request remote profile: %v\n", err)
+		os.Exit(1)
+	}
+	if apiKey != "" {
+		req.Header.Set("Authorization", "Bearer "+apiKey)
+	}
+	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "failed to request remote profile: %v\n", err)
 		os.Exit(1)
@@ -335,6 +343,9 @@ func status(configPath string) {
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "invalid server address: %v\n", err)
 		os.Exit(1)
+	}
+	if cfg.Server.APIKey != "" {
+		req.Header.Set("Authorization", "Bearer "+cfg.Server.APIKey)
 	}
 	client := &http.Client{Timeout: 5 * time.Second}
 

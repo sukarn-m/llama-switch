@@ -59,6 +59,19 @@ func (ps *ProxyServer) Shutdown() {
 // ── Request handling ─────────────────────────
 
 func (ps *ProxyServer) handle(w http.ResponseWriter, r *http.Request) {
+	// Security middleware, in order:
+	//   1. CORS preflight is answered here and never forwarded upstream.
+	//   2. The client API key gates every endpoint but /health.
+	//   3. A disallowed Origin on a state-changing request is refused.
+	if ps.applyCORS(w, r) {
+		return
+	}
+	if !ps.authenticate(w, r) {
+		return
+	}
+	if !ps.checkOrigin(w, r) {
+		return
+	}
 	if r.URL.Path == "/" || r.URL.Path == "/health" {
 		ps.handleHealth(w, r)
 		return
@@ -308,6 +321,15 @@ func (ps *ProxyServer) handleAdminProfile(w http.ResponseWriter, r *http.Request
 // ── Core proxy logic ─────────────────────────
 
 func (ps *ProxyServer) handleProxy(w http.ResponseWriter, r *http.Request) {
+	// Only known inference endpoints may be forwarded to a backend.
+	// llama.cpp's administrative surface (/props, /slots, /lora-adapters,
+	// /cors-proxy, /tools, /metrics) is not reachable through the proxy.
+	if !ps.cfg.forwardPathAllowed(r.URL.Path) {
+		writeJSONError(w, http.StatusForbidden,
+			fmt.Sprintf("path %s is not available through llama-switch", r.URL.Path))
+		return
+	}
+
 	// Limit request body size (SEC-1)
 	r.Body = http.MaxBytesReader(w, r.Body, 100<<20) // 100 MB
 
@@ -402,6 +424,12 @@ func (ps *ProxyServer) forward(w http.ResponseWriter, r *http.Request, bodyBytes
 	// Forward the original Host (HTTP-2 fix: use proxyReq.Host, not Header.Set)
 	proxyReq.Host = r.Host
 
+	// Authenticate to the backend with the backend's own API key. The
+	// client's Authorization header is dropped: it is the proxy's
+	// credential, and llama-server would otherwise reject it as an
+	// invalid backend key.
+	ps.prepareBackendRequest(proxyReq, backend)
+
 	// Add forwarding headers (HTTP-3)
 	// Append to X-Forwarded-For instead of overwriting (BUG-R2-5)
 	if prior := r.Header.Get("X-Forwarded-For"); prior != "" {
@@ -419,9 +447,15 @@ func (ps *ProxyServer) forward(w http.ResponseWriter, r *http.Request, bodyBytes
 	}
 	defer resp.Body.Close()
 
-	// Copy response headers
+	// Copy response headers, minus hop-by-hop and CORS headers.
+	// The backend's Access-Control-* headers are dropped: CORS is decided
+	// by the proxy (see security.go), so the backend must not be able to
+	// widen the policy or emit a contradictory second header.
 	for key, values := range resp.Header {
 		if isHopByHop(key) {
+			continue
+		}
+		if isBackendCORSHeader(key) {
 			continue
 		}
 		for _, v := range values {
@@ -499,6 +533,7 @@ func (ps *ProxyServer) forwardWithHandler(w http.ResponseWriter, r *http.Request
 		}
 	}
 	proxyReq.Host = r.Host
+	ps.prepareBackendRequest(proxyReq, backend)
 	if prior := r.Header.Get("X-Forwarded-For"); prior != "" {
 		proxyReq.Header.Set("X-Forwarded-For", prior+", "+r.RemoteAddr)
 	} else {

@@ -32,6 +32,30 @@ type ServerConfig struct {
 	QueueTimeoutSeconds   int    `yaml:"queue_timeout_seconds"`
 	ProfileDrainSeconds   int    `yaml:"profile_drain_seconds"`
 	ShutdownDrainSeconds  int    `yaml:"shutdown_drain_seconds"`
+
+	// ── Security ──
+	//
+	// APIKey, when set, is required on every endpoint except /health.
+	// Clients send it as "Authorization: Bearer <key>" or "X-Api-Key: <key>".
+	APIKey string `yaml:"api_key"`
+
+	// CORSAllowOrigins is the list of browser origins allowed to call the
+	// proxy. Entries are exact origins ("https://app.example"); "*" allows
+	// any origin. An empty list means no browser origin is allowed.
+	CORSAllowOrigins []string `yaml:"cors_allow_origins"`
+
+	// CORSAllowCredentials sends Access-Control-Allow-Credentials: true.
+	// Only meaningful with an explicit origin list — with "*" the concrete
+	// origin is echoed back instead, since "*" is invalid with credentials.
+	CORSAllowCredentials bool `yaml:"cors_allow_credentials"`
+
+	// CORSPreflightMaxAge is the Access-Control-Max-Age value for
+	// preflight responses, in seconds.
+	CORSPreflightMaxAge int `yaml:"cors_preflight_max_age"`
+
+	// ForwardPaths overrides the built-in list of backend paths the proxy
+	// will forward. An empty list uses defaultForwardPaths.
+	ForwardPaths []string `yaml:"forward_paths"`
 }
 
 type BackendConfig struct {
@@ -42,6 +66,13 @@ type BackendConfig struct {
 	NvidiaSMI      string            `yaml:"nvidia_smi"`
 	CtxCheckpoints int               `yaml:"ctx_checkpoints"`
 	CacheRAM       int               `yaml:"cache_ram"`
+
+	// APIKey, when set, is the credential the backends require. The proxy
+	// passes it to llama-server via LLAMA_API_KEY and sends it on every
+	// request, so no other local process can use a backend directly and
+	// bypass the proxy's routing and VRAM management. Only applied to
+	// models that run llama-server itself.
+	APIKey string `yaml:"api_key"`
 }
 
 type ModelConfig struct {
@@ -97,6 +128,20 @@ func expand(s string) string {
 	return strings.Join(parts, ":")
 }
 
+// expandSecret resolves $VAR and ${VAR} references in a secret value.
+//
+// Unlike expand(), it does not treat ":" as a path-list separator and
+// does not expand "~" — a secret is a single opaque token, and mangling
+// it would change the credential.
+func expandSecret(s string) string {
+	return os.Expand(s, func(key string) string {
+		if key == "" {
+			return ""
+		}
+		return os.Getenv(key)
+	})
+}
+
 // ── Loading ──────────────────────────────────
 
 func LoadConfig(path string) (*Config, error) {
@@ -150,6 +195,13 @@ func LoadConfig(path string) (*Config, error) {
 	if cfg.Backend.NvidiaSMI == "" {
 		cfg.Backend.NvidiaSMI = "nvidia-smi"
 	}
+	if cfg.Server.CORSPreflightMaxAge == 0 {
+		cfg.Server.CORSPreflightMaxAge = 600
+	}
+	// The API keys may be given as $VAR so they can live in the
+	// environment rather than in the config file.
+	cfg.Server.APIKey = expandSecret(cfg.Server.APIKey)
+	cfg.Backend.APIKey = expandSecret(cfg.Backend.APIKey)
 
 	// Apply global ctx_checkpoints default to models that don't set their own.
 	if cfg.Backend.CtxCheckpoints != 0 {
@@ -187,6 +239,28 @@ func (c *Config) Validate() error {
 	}
 	if c.Server.MaxModels < 1 {
 		return fmt.Errorf("max_models must be at least 1, got %d", c.Server.MaxModels)
+	}
+	for _, origin := range c.Server.CORSAllowOrigins {
+		origin = strings.TrimSpace(origin)
+		if origin == "" {
+			continue
+		}
+		switch origin {
+		case "*", "none", "localhost":
+			continue
+		}
+		if !strings.Contains(origin, "://") {
+			return fmt.Errorf("cors_allow_origins entry %q must be a full origin (scheme://host[:port]), \"*\", \"none\" or \"localhost\"", origin)
+		}
+	}
+	for _, p := range c.Server.ForwardPaths {
+		p = strings.TrimSpace(p)
+		if p == "" {
+			continue
+		}
+		if !strings.HasPrefix(p, "/") {
+			return fmt.Errorf("forward_paths entry %q must start with \"/\"", p)
+		}
 	}
 	seenID := make(map[string]bool, len(c.Models))
 	seenModel := make(map[string]bool, len(c.Models))
@@ -229,6 +303,29 @@ func (c *Config) FindModel(id string) *ModelConfig {
 		}
 	}
 	return nil
+}
+
+// setEnv returns env with the given variable set to value, replacing any
+// existing entry for that name. The result preserves the original
+// ordering of unrelated variables.
+func setEnv(env []string, name, value string) []string {
+	prefix := name + "="
+	out := make([]string, 0, len(env)+1)
+	replaced := false
+	for _, e := range env {
+		if strings.HasPrefix(e, prefix) {
+			if !replaced {
+				out = append(out, prefix+value)
+				replaced = true
+			}
+			continue
+		}
+		out = append(out, e)
+	}
+	if !replaced {
+		out = append(out, prefix+value)
+	}
+	return out
 }
 
 // ── Argument building ────────────────────────
@@ -288,6 +385,13 @@ func (m *ModelConfig) BuildArgs(common []string, port int) []string {
 	args = append(args, m.ExtraArgs...)
 
 	return args
+}
+
+// runsLlamaServer reports whether this model is served by llama-server
+// itself, as opposed to a custom binary or a raw args list. Only
+// llama-server models understand the --api-key flag.
+func (m *ModelConfig) runsLlamaServer() bool {
+	return m.Binary == "" && len(m.Args) == 0
 }
 
 // ResolveBinary returns the binary path to use for this model. If the
