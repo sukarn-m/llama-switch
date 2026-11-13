@@ -24,8 +24,9 @@ type Backend struct {
 	doneCh    chan struct{}
 	mu        sync.Mutex
 	lastReq   time.Time
-	inFlight  int64  // atomic; number of active proxied requests
-	apiKey    string // backend API key, if the backend requires one
+	startedAt time.Time // when the backend passed its health check; see vramSettleWindow
+	inFlight  int64     // atomic; number of active proxied requests
+	apiKey    string    // backend API key, if the backend requires one
 }
 
 // InFlightAdd increments the in-flight request counter.
@@ -534,6 +535,18 @@ func (bm *BackendManager) EnsureLoaded(modelID string) (*Backend, error) {
 	}
 }
 
+// vramSettleWindow is how long after a backend passes its health check we
+// keep counting its profiled VRAM as pending instead of trusting nvidia-smi
+// to reflect it. llama-server commits its buffers in fits and starts (its
+// memory-fitting pass allocates, frees, and reallocates during startup), so
+// for a few seconds after the health endpoint responds, nvidia-smi can
+// report several GB less than the backend will actually hold. Admitting
+// another model inside that window overcommits the GPU, and the losing
+// backend silently splits itself between GPU and CPU — an order of
+// magnitude slower, with no error anywhere (observed 2026-11-13: lfm3
+// admitted next to a just-healthy nemotron, dropped to 9.5 tok/s).
+const vramSettleWindow = 10 * time.Second
+
 // ensureCapacityLocked checks model count limits and VRAM, evicting
 // LRU models as needed. Caller must hold bm.mu.
 //
@@ -589,38 +602,9 @@ func (bm *BackendManager) ensureCapacityLocked(mc *ModelConfig) (err error) {
 	if needed > 0 {
 		for {
 			// Recompute pending each iteration: reservations change while
-			// the lock is released during the eviction sleep below.
-			pendingPerGPU := make([]int, 0)
-			for loadID := range bm.reserved {
-				if loadID == mc.ID {
-					continue // skip ourselves; we're checking if WE fit
-				}
-				if _, up := bm.backends[loadID]; up {
-					continue // already running; nvidia-smi reflects it
-				}
-				lmc := bm.cfg.FindModel(loadID)
-				if lmc == nil {
-					continue
-				}
-				pg := vramEstimatePerGPU(bm.vramCache, lmc, bm.cfg.Backend.CommonArgs)
-				if pg == nil {
-					// No per-GPU data; use aggregate as fallback
-					agg := vramEstimate(bm.vramCache, lmc, bm.cfg.Backend.CommonArgs)
-					if agg > 0 {
-						if len(pendingPerGPU) == 0 {
-							pendingPerGPU = []int{0}
-						}
-						pendingPerGPU[0] += agg
-					}
-					continue
-				}
-				for len(pendingPerGPU) < len(pg) {
-					pendingPerGPU = append(pendingPerGPU, 0)
-				}
-				for i, v := range pg {
-					pendingPerGPU[i] += v
-				}
-			}
+			// the lock is released during the eviction sleep below, and
+			// backends cross the settle window as time passes.
+			pendingPerGPU := bm.pendingVRAMPerGPU(mc.ID)
 
 			stats, qerr := queryVRAM(bm.cfg.Backend.NvidiaSMI)
 			if qerr != nil {
@@ -682,6 +666,64 @@ func (bm *BackendManager) ensureCapacityLocked(mc *ModelConfig) (err error) {
 	return nil
 }
 
+// pendingVRAMPerGPU estimates the per-GPU VRAM (MB) that is spoken for but
+// not yet reliably visible to nvidia-smi: models that hold a reservation and
+// have not spawned yet, plus backends that became healthy within
+// vramSettleWindow (llama-server may still be committing buffers). Returns
+// nil when nothing is pending. Caller must hold bm.mu.
+func (bm *BackendManager) pendingVRAMPerGPU(excludeID string) []int {
+	var pending []int
+
+	// add folds one model's profiled VRAM into pending, falling back to the
+	// aggregate estimate on GPU 0 when no per-GPU breakdown is cached.
+	add := func(id string) {
+		lmc := bm.cfg.FindModel(id)
+		if lmc == nil {
+			return
+		}
+		pg := vramEstimatePerGPU(bm.vramCache, lmc, bm.cfg.Backend.CommonArgs)
+		if pg == nil {
+			// No per-GPU data; use aggregate as fallback
+			if agg := vramEstimate(bm.vramCache, lmc, bm.cfg.Backend.CommonArgs); agg > 0 {
+				for len(pending) < 1 {
+					pending = append(pending, 0)
+				}
+				pending[0] += agg
+			}
+			return
+		}
+		for len(pending) < len(pg) {
+			pending = append(pending, 0)
+		}
+		for i, v := range pg {
+			pending[i] += v
+		}
+	}
+
+	// Reserved models that are not running yet: nvidia-smi cannot see them.
+	for id := range bm.reserved {
+		if id == excludeID {
+			continue // skip ourselves; we're checking if WE fit
+		}
+		if _, up := bm.backends[id]; up {
+			continue // already in the map (young ones handled below)
+		}
+		add(id)
+	}
+
+	// Recently started backends: in the map, but their buffers may not be
+	// visible to nvidia-smi yet (see vramSettleWindow).
+	for id, b := range bm.backends {
+		if id == excludeID {
+			continue
+		}
+		if time.Since(b.startedAt) < vramSettleWindow {
+			add(id)
+		}
+	}
+	return pending
+}
+
 // evictLRULocked unloads the least-recently-used backend that has no
 // active requests. If all backends are busy, returns an error.
 // Caller must hold bm.mu.
@@ -691,6 +733,12 @@ func (bm *BackendManager) evictLRULocked() error {
 
 	for id, b := range bm.backends {
 		if b.InFlight() == 0 {
+			// A freshly started backend is about to serve the request that
+			// triggered its load; evicting it would yank the model out from
+			// under that caller. Once its VRAM has settled it is fair game.
+			if time.Since(b.startedAt) < vramSettleWindow {
+				continue
+			}
 			lastReq := b.lastRequest()
 			if oldestID == "" || lastReq.Before(oldestTime) {
 				oldestID = id
@@ -816,6 +864,7 @@ func (bm *BackendManager) startBackendLocked(mc *ModelConfig) (*Backend, error) 
 	}
 
 	// Add to map only after health check passes
+	b.startedAt = time.Now()
 	bm.backends[mc.ID] = b
 
 	// --- Auto-profile: release lock during the 3s settle (CONC-2 fix) ---
