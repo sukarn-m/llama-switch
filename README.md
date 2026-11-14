@@ -11,7 +11,7 @@ No model is loaded until the first request for it arrives. When VRAM is tight, t
 ```
 Client ──HTTP──▶ llama-switch (:8080)
                     │
-                    ├─ GET  /v1/models       → model list with loaded/unloaded status
+                    ├─ GET  /v1/models       → model list with loaded/unloaded status + input_modalities
                     ├─ GET  /models          → llama.cpp router-style model list
                     ├─ POST /models/load     → explicitly load a model
                     ├─ POST /models/unload   → eject a model from VRAM

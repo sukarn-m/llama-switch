@@ -99,6 +99,25 @@ type ModelConfig struct {
 	Args       []string          `yaml:"args"`
 	HealthPath string            `yaml:"health_path"`
 	Env        map[string]string `yaml:"env"`
+
+	// Vision overrides image-input detection for the model lists. Unset:
+	// a model accepts images iff Mmproj is set. Set it on models whose
+	// raw Args load a vision projector (or to hide one).
+	Vision *bool `yaml:"vision"`
+}
+
+// InputModalities reports what the model accepts as input, for the
+// /v1/models and /models catalogs: ["text","image"] for vision models,
+// ["text"] otherwise.
+func (m *ModelConfig) InputModalities() []string {
+	vision := m.Mmproj != ""
+	if m.Vision != nil {
+		vision = *m.Vision
+	}
+	if vision {
+		return []string{"text", "image"}
+	}
+	return []string{"text"}
 }
 
 // ── Path & env expansion ─────────────────────

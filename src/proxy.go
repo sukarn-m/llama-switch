@@ -144,6 +144,8 @@ func (ps *ProxyServer) handleV1Models(w http.ResponseWriter, r *http.Request) {
 			"created":  0,
 			"owned_by": "llama-switch",
 			"status":   map[string]any{"value": statusVal},
+
+			"input_modalities": m.InputModalities(),
 		}
 		if m.ContextSize > 0 {
 			parallel := m.Parallel
@@ -173,6 +175,8 @@ func (ps *ProxyServer) handleModels(w http.ResponseWriter, r *http.Request) {
 			"id":     m.Name,
 			"path":   expand(m.Path),
 			"status": map[string]any{"value": statusVal},
+
+			"input_modalities": m.InputModalities(),
 		}
 		if m.ContextSize > 0 {
 			parallel := m.Parallel

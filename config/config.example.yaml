@@ -65,7 +65,8 @@ models:
   - id: example-model
     name: Example-Model-1.0
     path: "~/models/example-model.gguf"
-    mmproj: "~/models/mmproj-F32.gguf"
+    mmproj: "~/models/mmproj-F32.gguf"   # also makes /v1/models advertise image input
+    # vision: true   # override image-input detection (e.g. for raw `args` models)
     context_size: 0   # 0 = let llama-server use the model's default context
     parallel: 2
     devices: ["CUDA0", "CUDA1"]

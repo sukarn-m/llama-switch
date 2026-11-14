@@ -39,7 +39,7 @@ The repo is split into three directories plus module/docs files at the root. All
 Client ──HTTP──▶ ProxyServer (:8080)
                    │
                    ├─ GET  /                → health
-                   ├─ GET  /v1/models       → OpenAI model list (with status field)
+                   ├─ GET  /v1/models       → OpenAI model list (status, context_length, input_modalities)
                    ├─ GET  /models          → llama.cpp router model list (with status)
                    ├─ POST /models/load     → explicitly load a model {"model":"id"}
                    ├─ POST /models/unload   → explicitly unload {"model":"id"} (Open WebUI "Eject")
@@ -102,7 +102,7 @@ The Chandra handler (`src/chandra_handler.go`) post-processes responses from the
 
 - `server`: `host`, `port`, `backend_port_start/end`, `max_models`, `idle_timeout_minutes`, `health_timeout_seconds`, `sweep_interval_seconds`.
 - `backend`: `binary` (path to `llama-server`), `env` (notably `LD_LIBRARY_PATH` for CUDA libs), `common_args` (flags prepended to every model invocation), `workdir`, `nvidia_smi`, `ctx_checkpoints` (global default for `--ctx-checkpoints`), `cache_ram` (global default for `--cache-ram`, in MiB).
-- `models`: list of `ModelConfig`. Lookup by `id` or `name` (`FindModel` matches `id` exactly, `name` case-insensitively). Each builds its llama-server args via `ModelConfig.BuildArgs`. Supports `mmproj` (multimodal), `tensor_split`, `ctx_checkpoints`, `cache_ram`, and freeform `extra_args`. Optional per-model override fields (`binary`, `args`, `health_path`, `env`) allow running non-llama-server backends — see [Per-model runtime override](#per-model-runtime-override).
+- `models`: list of `ModelConfig`. Lookup by `id` or `name` (`FindModel` matches `id` exactly, `name` case-insensitively). Each builds its llama-server args via `ModelConfig.BuildArgs`. Supports `mmproj` (multimodal), `tensor_split`, `ctx_checkpoints`, `cache_ram`, and freeform `extra_args`. Optional per-model override fields (`binary`, `args`, `health_path`, `env`) allow running non-llama-server backends — see [Per-model runtime override](#per-model-runtime-override). Both model lists (`/v1/models`, `/models`) emit `input_modalities` via `ModelConfig.InputModalities()`: `["text","image"]` when `mmproj` is set, else `["text"]`; the optional `vision` bool overrides this (needed for raw-`args` models, whose projector llama-switch can't see). Clients such as sai-portal sync vision capability from it.
 - Path expansion: `~`, `~/...`, and `$VAR` are expanded in config values (`expand()`), including colon-separated `LD_LIBRARY_PATH`-style lists.
 
 **Defaults applied when fields are zero/empty:** `backend_port_start=8201`, `backend_port_end=8299`, `max_models=2`, `idle_timeout_minutes=60`, `health_timeout_seconds=180`, `sweep_interval_seconds=15`, `queue_max_depth=64`, `queue_timeout_seconds=600`, `profile_drain_seconds=60`, `shutdown_drain_seconds=120`, `nvidia_smi="nvidia-smi"`. Validation rejects `server.port` overlapping the backend port range.

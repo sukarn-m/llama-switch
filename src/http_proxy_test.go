@@ -114,6 +114,48 @@ func TestHandleV1ModelsEmpty(t *testing.T) {
 	}
 }
 
+// TestModelListsInputModalities checks that both catalogs advertise image
+// input for mmproj models and honour the explicit vision override.
+func TestModelListsInputModalities(t *testing.T) {
+	yes, no := true, false
+	models := []ModelConfig{
+		{ID: "text", Name: "Text", Path: "/t.gguf"},
+		{ID: "vlm", Name: "VLM", Path: "/v.gguf", Mmproj: "/mmproj.gguf"},
+		{ID: "raw", Name: "Raw", Args: []string{"--port", "{port}"}, Vision: &yes},
+		{ID: "hidden", Name: "Hidden", Path: "/h.gguf", Mmproj: "/mmproj.gguf", Vision: &no},
+	}
+	want := map[string]string{"Text": "text", "VLM": "text,image", "Raw": "text,image", "Hidden": "text"}
+	ps := newTestProxyServer(t, models, nil)
+
+	for _, tc := range []struct {
+		path    string
+		handler func(http.ResponseWriter, *http.Request)
+	}{
+		{"/v1/models", ps.handleV1Models},
+		{"/models", ps.handleModels},
+	} {
+		w := httptest.NewRecorder()
+		tc.handler(w, httptest.NewRequest("GET", tc.path, nil))
+		var result struct {
+			Data []struct {
+				ID              string   `json:"id"`
+				InputModalities []string `json:"input_modalities"`
+			} `json:"data"`
+		}
+		if err := json.NewDecoder(w.Result().Body).Decode(&result); err != nil {
+			t.Fatalf("%s: decode: %v", tc.path, err)
+		}
+		if len(result.Data) != len(want) {
+			t.Fatalf("%s: expected %d models, got %d", tc.path, len(want), len(result.Data))
+		}
+		for _, m := range result.Data {
+			if got := strings.Join(m.InputModalities, ","); got != want[m.ID] {
+				t.Errorf("%s %s: input_modalities = %q, want %q", tc.path, m.ID, got, want[m.ID])
+			}
+		}
+	}
+}
+
 // ── handleModels tests ────────────────────────────────────────────────
 
 func TestHandleModels(t *testing.T) {
