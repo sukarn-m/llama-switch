@@ -3,6 +3,7 @@ package main
 import (
 	"fmt"
 	"os"
+	"strings"
 	"testing"
 	"time"
 )
@@ -204,5 +205,47 @@ func TestAdmissionDefersToUnsettledBackend(t *testing.T) {
 	}
 	if aStill {
 		t.Fatal("settled backend a should have been evicted for b")
+	}
+}
+
+// A request for another model that arrives while the only loaded backend is
+// still inside its settle window cannot evict it yet. Nothing signals the
+// capacity queue when the window ends, so the waiter must wake up on its own
+// at that moment instead of sleeping until the queue timeout (observed
+// 2026-11-14: a model switch 6 s after a load stalled for the full 600 s).
+func TestCapacityQueueWakesWhenBackendSettles(t *testing.T) {
+	cfg := settleTestConfig("", 1)
+	cfg.Server.QueueTimeoutSeconds = 30
+	bm := NewBackendManager(cfg, "", NewLogger())
+
+	a := &Backend{ID: "a", Port: 18201, startedAt: time.Now().Add(-vramSettleWindow + time.Second)}
+	a.setLastRequest(time.Now())
+	bm.mu.Lock()
+	bm.backends["a"] = a
+	bm.mu.Unlock()
+
+	start := time.Now()
+	done := make(chan error, 1)
+	go func() {
+		_, err := bm.EnsureLoaded("b")
+		done <- err
+	}()
+
+	select {
+	case err := <-done:
+		if err != nil && strings.Contains(err.Error(), "queue timeout") {
+			t.Fatalf("waiter timed out instead of waking at settle: %v", err)
+		}
+		if elapsed := time.Since(start); elapsed > 5*time.Second {
+			t.Fatalf("waiter took %v; should wake ~1 s after a settles", elapsed)
+		}
+		bm.mu.RLock()
+		_, aStill := bm.backends["a"]
+		bm.mu.RUnlock()
+		if aStill {
+			t.Fatal("settled backend a should have been evicted for b")
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("EnsureLoaded still waiting 10 s after a settled")
 	}
 }

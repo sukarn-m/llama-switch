@@ -467,11 +467,20 @@ func (bm *BackendManager) EnsureLoaded(modelID string) (*Backend, error) {
 			// Increment queue depth, snapshot channel, release lock, wait
 			atomic.AddInt64(&bm.queueDepth, 1)
 			capCh := bm.capCh
+			// A backend leaving its settle window can make room (it becomes
+			// evictable and its VRAM stops counting as pending), but nothing
+			// signals capCh when that happens. Wake up then and re-check,
+			// or a request arriving just after another model's load would
+			// wait out the whole queue timeout.
+			wake := deadline
+			if s := bm.nextSettleLocked(); !s.IsZero() && s.Before(wake) {
+				wake = s
+			}
 			bm.mu.Unlock()
 
 			// Use a stoppable timer so woken waiters don't leak a timer
 			// goroutine for the full queue timeout (default 600 s).
-			t := time.NewTimer(time.Until(deadline))
+			t := time.NewTimer(time.Until(wake))
 			select {
 			case <-capCh:
 				t.Stop()
@@ -546,6 +555,23 @@ func (bm *BackendManager) EnsureLoaded(modelID string) (*Backend, error) {
 // magnitude slower, with no error anywhere (observed 2026-11-13: lfm3
 // admitted next to a just-healthy nemotron, dropped to 9.5 tok/s).
 const vramSettleWindow = 10 * time.Second
+
+// nextSettleLocked returns the earliest time a loaded backend leaves its
+// vramSettleWindow, or the zero time if every backend has already settled.
+// Caller must hold bm.mu.
+func (bm *BackendManager) nextSettleLocked() time.Time {
+	var next time.Time
+	for _, b := range bm.backends {
+		s := b.startedAt.Add(vramSettleWindow)
+		if !s.After(time.Now()) {
+			continue
+		}
+		if next.IsZero() || s.Before(next) {
+			next = s
+		}
+	}
+	return next
+}
 
 // ensureCapacityLocked checks model count limits and VRAM, evicting
 // LRU models as needed. Caller must hold bm.mu.
