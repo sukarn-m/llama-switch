@@ -39,9 +39,9 @@ server:
   forward_paths: []
 
 backend:
-  binary: "~/sources/llama.cpp-cuda/llama-server"
+  binary: "~/.unsloth/llama.cpp/llama-server"
   env:
-    LD_LIBRARY_PATH: "~/sources/llama.cpp-cuda:~/.local/lib/python3.14/site-packages/nvidia/nccl/lib:~/.local/lib/python3.14/site-packages/nvidia/cudnn/lib"
+    LD_LIBRARY_PATH: "/lib64:/usr/lib64"
   common_args:
     - "--batch-size"
     - "2048"

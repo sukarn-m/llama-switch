@@ -4,6 +4,7 @@
 # Machine-specific generated files
 /config/config.yaml
 /config/vram-cache.json
+/config/backups/
 
 # AI agent / tool working directories
 /.hermes/

@@ -98,6 +98,34 @@ The Chandra handler (`src/chandra_handler.go`) post-processes responses from the
 4. **Fixes Devanagari conjunct errors** — Chandra drops the `र` in certain conjuncts (कय→क्रय, केता→क्रेता, विकय→विक्रय, केती→क्रेती)
 5. **Strips page headers/footers** — blocks with `data-label="Page-Header"` or `"Page-Footer"` are omitted
 
+## Engine: the llama-server binary
+
+The backends run **Unsloth Studio's prebuilt llama.cpp**, not a locally built
+one: `~/.unsloth/llama.cpp/llama-server` (a symlink into
+`~/.unsloth/llama.cpp/build/bin/`). It is the `unslothai/llama.cpp` fork tag
+`b12347-mix-241a0f3` (upstream base `b12347`), built against the CUDA 13.3
+toolkit.
+
+- **Runtime deps:** only `libcudart.so.13`, `libcublas.so.13` and
+  `libcublasLt.so.13`, all served by the system CUDA 13 in `/lib64`. So
+  `backend.env.LD_LIBRARY_PATH` is `/lib64:/usr/lib64` and nothing else: no
+  LM Studio vendor directory, no pip `nvidia-*` wheels, no NCCL.
+- **NCCL is off** in this build. It only ever mattered for row-split
+  all-reduce, and the GPU layout here is layer split, so nothing is lost.
+- **SM coverage is 75-89 only** (RTX 3090 sm_86 and RTX 2060 sm_75 both fit).
+  A Hopper or Blackwell card would need a different build.
+- **The daily updater is disabled.** `llama-cpp-update.timer` (with
+  `~/scripts/llama-cpp-update.sh`) used to refresh an ai-dock CUDA 12.8 build
+  in `~/sources/llama.cpp-cuda`. That tree has been deleted, so the timer is
+  off; re-enable it only if you go back to the ai-dock build (the script
+  re-downloads it).
+- **Unsloth Studio owns that directory.** Do not edit or replace files under
+  `~/.unsloth/llama.cpp/`: Unsloth Studio manages them and may replace them
+  on its own updates.
+- **The CLI is flag-compatible** with the ai-dock build it replaced (the
+  `--help` output was byte identical at the time of the swap), so the flags in
+  `config/config.yaml` carry over unchanged.
+
 ## Configuration reference (`config/config.yaml`)
 
 - `server`: `host`, `port`, `backend_port_start/end`, `max_models`, `idle_timeout_minutes`, `health_timeout_seconds`, `sweep_interval_seconds`.
@@ -160,6 +188,7 @@ journalctl --user -u llama-switch -f
 - **Change eviction policy:** `ensureCapacityLocked` and `evictLRULocked` in `src/backend.go`. LRU is based on `Backend.lastReq`, updated via `Touch()` on every proxied request.
 - **Change CLI surface:** `src/main.go` `switch cmd` block + `usageText`. `parseConfigArg` handles config-path discovery.
 - **Rebuild after edits:** `go build -o bin/llama-switch ./src` (replaces `bin/llama-switch`); restart the systemd unit if running as a service.
+- **After an engine change:** `config.yaml` is read only at startup, so restart the `llama-switch` unit to apply a new `backend.binary` or `backend.env`. Then re-measure VRAM with `./bin/llama-switch profile --force` (the plain `profile` command reuses cached measurements from `config/vram-cache.json`, which are engine specific).
 
 ## Things to watch out for
 
