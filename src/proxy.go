@@ -266,7 +266,8 @@ func (ps *ProxyServer) handleModelUnload(w http.ResponseWriter, r *http.Request)
 		return
 	}
 
-	err = ps.bm.StopModel(req.Model, req.Force)
+	err = ps.bm.StopModel(req.Model, req.Force,
+		fmt.Sprintf("unload requested via /models/unload by %s (force=%v)", r.RemoteAddr, req.Force))
 	if err != nil {
 		if strings.Contains(err.Error(), "active request(s)") {
 			writeJSONError(w, http.StatusConflict,

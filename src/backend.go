@@ -153,7 +153,7 @@ func (bm *BackendManager) Stop() {
 	// Wake capacity-queue waiters blocked on capCh.
 	bm.signalCapacityLocked()
 	for id, b := range bm.backends {
-		bm.stopLocked(id, b)
+		bm.stopLocked(id, b, "llama-switch shutting down")
 	}
 }
 
@@ -226,7 +226,7 @@ func (bm *BackendManager) WaitIdle(timeout time.Duration) error {
 // Use only after WaitIdle confirms no active requests.
 func (bm *BackendManager) evictAllLocked() {
 	for id, b := range bm.backends {
-		bm.stopLocked(id, b)
+		bm.stopLocked(id, b, "evicting all backends")
 	}
 }
 
@@ -354,7 +354,7 @@ func (bm *BackendManager) profileSingleModel(mc *ModelConfig) (int, []int, error
 
 	after, err := queryVRAM(bm.cfg.Backend.NvidiaSMI)
 	if err != nil {
-		_ = bm.StopModel(mc.ID, true)
+		_ = bm.StopModel(mc.ID, true, "VRAM profiling failed (nvidia-smi query)")
 		return 0, nil, fmt.Errorf("post-load VRAM query: %w", err)
 	}
 
@@ -364,7 +364,7 @@ func (bm *BackendManager) profileSingleModel(mc *ModelConfig) (int, []int, error
 	}
 	gpuVRAM := computePerGPUDelta(before, after)
 
-	_ = bm.StopModel(mc.ID, true)
+	_ = bm.StopModel(mc.ID, true, "VRAM profiling finished")
 
 	if verr := validateVRAMMeasurement(mc, used); verr != nil {
 		return 0, nil, verr
@@ -526,7 +526,7 @@ func (bm *BackendManager) EnsureLoaded(modelID string) (*Backend, error) {
 			}
 			bm.logger.Printf("load %s failed (attempt %d): %v — evicting LRU to retry",
 				mc.ID, attempt+1, startErr)
-			if err := bm.evictLRULocked(); err != nil {
+			if err := bm.evictLRULocked(fmt.Sprintf("making room to retry failed load of %s", mc.ID)); err != nil {
 				deleteLoading()
 				bm.mu.Unlock()
 				return nil, fmt.Errorf("%w (and no backends left to evict: %v)", startErr, err)
@@ -616,7 +616,9 @@ func (bm *BackendManager) ensureCapacityLocked(mc *ModelConfig) (err error) {
 	// 1. Count limit: evict if loaded + reserved + this model would exceed MaxModels.
 	for len(bm.backends)+othersReserved()+1 > bm.cfg.Server.MaxModels {
 		bm.reserved[mc.ID] = true
-		if err := bm.evictLRULocked(); err != nil {
+		reason := fmt.Sprintf("max_models (%d) reached, making room for %s",
+			bm.cfg.Server.MaxModels, mc.ID)
+		if err := bm.evictLRULocked(reason); err != nil {
 			return fmt.Errorf("cannot make room for %s: %w", mc.ID, err)
 		}
 	}
@@ -678,7 +680,9 @@ func (bm *BackendManager) ensureCapacityLocked(mc *ModelConfig) (err error) {
 			// sleep below and a concurrent admission check must see that
 			// the VRAM we are freeing is spoken for.
 			bm.reserved[mc.ID] = true
-			if err := bm.evictLRULocked(); err != nil {
+			reason := fmt.Sprintf("not enough VRAM for %s (needs ~%d MB; free %s)",
+				mc.ID, needed, formatFreePerGPU(stats))
+			if err := bm.evictLRULocked(reason); err != nil {
 				return err
 			}
 			// Give GPU a moment to actually release VRAM after kill
@@ -751,9 +755,9 @@ func (bm *BackendManager) pendingVRAMPerGPU(excludeID string) []int {
 }
 
 // evictLRULocked unloads the least-recently-used backend that has no
-// active requests. If all backends are busy, returns an error.
-// Caller must hold bm.mu.
-func (bm *BackendManager) evictLRULocked() error {
+// active requests, logging reason. If all backends are busy, returns an
+// error. Caller must hold bm.mu.
+func (bm *BackendManager) evictLRULocked(reason string) error {
 	var oldestID string
 	var oldestTime time.Time
 
@@ -777,7 +781,9 @@ func (bm *BackendManager) evictLRULocked() error {
 		return fmt.Errorf("no evictable backends (all have active requests)")
 	}
 
-	bm.stopLocked(oldestID, bm.backends[oldestID])
+	bm.stopLocked(oldestID, bm.backends[oldestID],
+		fmt.Sprintf("evicted as least recently used (last request %s ago): %s",
+			time.Since(oldestTime).Round(time.Second), reason))
 	return nil
 }
 
@@ -885,7 +891,7 @@ func (bm *BackendManager) startBackendLocked(mc *ModelConfig) (*Backend, error) 
 	bm.mu.Lock()
 
 	if err != nil {
-		bm.stopLocked(mc.ID, b)
+		bm.stopLocked(mc.ID, b, fmt.Sprintf("health check failed: %v", err))
 		return nil, fmt.Errorf("health check failed for %s: %w", mc.ID, err)
 	}
 
@@ -955,12 +961,14 @@ func (bm *BackendManager) startBackendLocked(mc *ModelConfig) (*Backend, error) 
 	return b, nil
 }
 
-// stopLocked kills a backend process and removes it from the map.
+// stopLocked kills a backend process and removes it from the map,
+// logging reason so the journal shows why each model was unloaded.
 // Caller must hold bm.mu.
-func (bm *BackendManager) stopLocked(id string, b *Backend) {
+func (bm *BackendManager) stopLocked(id string, b *Backend, reason string) {
 	if b == nil {
 		return
 	}
+	bm.logger.Printf("[%s] unloading: %s", id, reason)
 	if b.cmd != nil && b.cmd.Process != nil {
 		_ = b.cmd.Process.Signal(os.Interrupt)
 		select {
@@ -978,7 +986,8 @@ func (bm *BackendManager) stopLocked(id string, b *Backend) {
 // from any accepted name (id or display name). When force is false,
 // returns an error if the backend has active in-flight requests.
 // When force is true, kills the backend regardless of active requests.
-func (bm *BackendManager) StopModel(id string, force bool) error {
+// reason is logged with the unload.
+func (bm *BackendManager) StopModel(id string, force bool, reason string) error {
 	mc := bm.cfg.FindModel(id)
 	if mc == nil {
 		return fmt.Errorf("unknown model: %s", id)
@@ -994,7 +1003,7 @@ func (bm *BackendManager) StopModel(id string, force bool) error {
 	if !force && b.InFlight() > 0 {
 		return fmt.Errorf("model %s has %d active request(s), cannot unload", id, b.InFlight())
 	}
-	bm.stopLocked(canonicalID, b)
+	bm.stopLocked(canonicalID, b, reason)
 	return nil
 }
 
@@ -1085,8 +1094,9 @@ func (bm *BackendManager) sweepIdle(idleLimit time.Duration) {
 	now := time.Now()
 	for id, b := range bm.backends {
 		if b.InFlight() == 0 {
-			if now.Sub(b.lastRequest()) > idleLimit {
-				bm.stopLocked(id, b)
+			if idle := now.Sub(b.lastRequest()); idle > idleLimit {
+				bm.stopLocked(id, b, fmt.Sprintf("idle for %s (idle_timeout_minutes = %d)",
+					idle.Round(time.Second), bm.cfg.Server.IdleTimeoutMinutes))
 			}
 		}
 	}
@@ -1151,4 +1161,17 @@ func (bm *BackendManager) logPipe(r io.ReadCloser, prefix string) {
 	if err := scanner.Err(); err != nil {
 		bm.logger.Printf("%s log reader error: %v", prefix, err)
 	}
+}
+
+// formatFreePerGPU renders per-GPU free VRAM for log messages, e.g.
+// "GPU0 812 MB, GPU1 5120 MB". Free values include pending-load adjustments.
+func formatFreePerGPU(stats *VRAMStats) string {
+	if stats == nil || len(stats.GPUs) == 0 {
+		return "unknown"
+	}
+	parts := make([]string, len(stats.GPUs))
+	for i, g := range stats.GPUs {
+		parts[i] = fmt.Sprintf("GPU%d %d MB", i, g.Free)
+	}
+	return strings.Join(parts, ", ")
 }

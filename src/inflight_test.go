@@ -71,7 +71,7 @@ func TestEvictSkipsInFlightBackends(t *testing.T) {
 	bmA.InFlightAdd()
 	bmB.InFlightAdd()
 
-	err := bm.evictLRULocked()
+	err := bm.evictLRULocked("test")
 	if err == nil {
 		t.Fatal("expected error when all backends are in-flight")
 	}
@@ -79,7 +79,7 @@ func TestEvictSkipsInFlightBackends(t *testing.T) {
 	// Release A (oldest), now eviction should pick A
 	bmA.InFlightDone()
 	bmB.InFlightDone()
-	err = bm.evictLRULocked()
+	err = bm.evictLRULocked("test")
 	if err != nil {
 		t.Fatalf("expected successful eviction, got: %v", err)
 	}
@@ -138,13 +138,13 @@ func TestStopModelRefusesInFlight(t *testing.T) {
 
 	b.InFlightAdd()
 
-	err := bm.StopModel("a", false)
+	err := bm.StopModel("a", false, "test")
 	if err == nil {
 		t.Fatal("expected error when stopping in-flight backend")
 	}
 
 	b.InFlightDone()
-	err = bm.StopModel("a", false)
+	err = bm.StopModel("a", false, "test")
 	if err != nil {
 		t.Fatalf("expected success after in-flight completes, got: %v", err)
 	}
@@ -166,7 +166,7 @@ func TestStopModelForceKillsInFlight(t *testing.T) {
 	b.InFlightAdd()
 	defer b.InFlightDone()
 
-	err := bm.StopModel("a", true)
+	err := bm.StopModel("a", true, "test")
 	if err != nil {
 		t.Fatalf("expected force stop to succeed despite in-flight, got: %v", err)
 	}

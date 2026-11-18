@@ -118,7 +118,7 @@ func TestEvictSkipsYoungBackends(t *testing.T) {
 	old.setLastRequest(time.Now())
 	bm.backends["young"] = young
 	bm.backends["old"] = old
-	err := bm.evictLRULocked()
+	err := bm.evictLRULocked("test")
 	_, youngLeft := bm.backends["young"]
 	_, oldLeft := bm.backends["old"]
 	bm.mu.Unlock()
@@ -141,7 +141,7 @@ func TestEvictAllYoungErrors(t *testing.T) {
 	bm.mu.Lock()
 	bm.backends["x"] = &Backend{ID: "x", Port: 18201, startedAt: time.Now()}
 	bm.backends["y"] = &Backend{ID: "y", Port: 18202, startedAt: time.Now()}
-	err := bm.evictLRULocked()
+	err := bm.evictLRULocked("test")
 	n := len(bm.backends)
 	bm.mu.Unlock()
 
