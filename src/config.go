@@ -33,6 +33,12 @@ type ServerConfig struct {
 	ProfileDrainSeconds   int    `yaml:"profile_drain_seconds"`
 	ShutdownDrainSeconds  int    `yaml:"shutdown_drain_seconds"`
 
+	// StreamPromptProgress asks llama-server for prompt-processing progress
+	// on streamed chat requests and forwards it as an early opening chunk
+	// plus SSE comments, so clients with a first-event timeout do not give
+	// up on a long prompt (see promptprogress.go). Unset means true.
+	StreamPromptProgress *bool `yaml:"stream_prompt_progress"`
+
 	// ── Security ──
 	//
 	// APIKey, when set, is required on every endpoint except /health.

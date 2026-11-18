@@ -411,6 +411,10 @@ func (ps *ProxyServer) forward(w http.ResponseWriter, r *http.Request, bodyBytes
 		target += "?" + r.URL.RawQuery
 	}
 
+	// Streamed chat requests get llama-server's prompt progress, turned into
+	// an early opening chunk plus SSE comments (see promptprogress.go).
+	bodyBytes, progress := ps.preparePromptProgress(r.URL.Path, backend, bodyBytes)
+
 	proxyReq, err := http.NewRequestWithContext(r.Context(), r.Method, target, bytes.NewReader(bodyBytes))
 	if err != nil {
 		http.Error(w, fmt.Sprintf("failed to create request: %v", err), http.StatusInternalServerError)
@@ -478,7 +482,7 @@ func (ps *ProxyServer) forward(w http.ResponseWriter, r *http.Request, bodyBytes
 	// (JSON bodies, downloads) use a plain 32 KB copy.
 	flusher, _ := w.(http.Flusher)
 	if flusher != nil && strings.Contains(resp.Header.Get("Content-Type"), "text/event-stream") {
-		streamSSE(w, resp.Body, flusher)
+		streamSSE(w, resp.Body, flusher, progress)
 		return
 	}
 	io.Copy(w, resp.Body) // client disconnect aborts via write error
@@ -486,11 +490,16 @@ func (ps *ProxyServer) forward(w http.ResponseWriter, r *http.Request, bodyBytes
 
 // streamSSE copies an SSE stream from src to w line by line, flushing
 // after every blank line (end of an SSE event). Trailing partial data is
-// flushed when the stream ends. Returns on client write error.
-func streamSSE(w http.ResponseWriter, src io.Reader, flusher http.Flusher) {
+// flushed when the stream ends. Returns on client write error. A non-nil
+// progress rewriter replaces llama-server's prompt-progress chunks (see
+// promptprogress.go); nil passes every line through unchanged.
+func streamSSE(w http.ResponseWriter, src io.Reader, flusher http.Flusher, progress *progressRewriter) {
 	br := bufio.NewReaderSize(src, 4096)
 	for {
 		chunk, err := br.ReadString('\n')
+		if progress != nil && err == nil {
+			chunk = progress.rewrite(chunk)
+		}
 		if chunk != "" {
 			if _, werr := io.WriteString(w, chunk); werr != nil {
 				return // client disconnected

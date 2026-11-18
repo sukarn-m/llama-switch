@@ -21,6 +21,7 @@ The repo is split into three directories plus module/docs files at the root. All
 | `src/main.go` | CLI entry point (`serve`, `profile`, `models`, `status`, `help`), usage text, graceful shutdown, VRAM profiling loop. `profileSingle` returns `(int, []int, error)` — total VRAM and per-GPU slice. |
 | `src/config.go` | YAML config types (`Config`, `ServerConfig`, `BackendConfig`, `ModelConfig`), loading, defaults, `~`/`$VAR` path expansion, llama-server argument & env building. |
 | `src/backend.go` | `Backend` (one llama-server process) and `BackendManager` (lifecycle, port allocation, health checks, LRU eviction, idle sweeper). Core of the system. |
+| `src/promptprogress.go` | Prompt-progress keepalive: adds `return_progress` to streamed chat requests and rewrites llama-server's progress chunks (see [Prompt-progress keepalive](#prompt-progress-keepalive)). |
 | `src/proxy.go` | `ProxyServer` — the client-facing HTTP server. Routing, model extraction from request body, streaming/non-streaming forwarding, hop-by-hop header stripping. Also contains the model handler hook (`forwardWithHandler`) and `forceNonStream` helper for models that need response post-processing. |
 | `src/chandra_handler.go` | **Model handler module** for Chandra 2 OCR. Implements the `ModelHandler` interface: intercepts backend responses, extracts HTML from `content`/`reasoning_content`, converts to markdown, fixes Devanagari conjunct errors, strips chain-of-thought. Self-contained — can be removed cleanly (see [Model handlers](#model-handlers)). |
 | `src/vram.go` | `nvidia-smi` VRAM querying, `VRAMCache` JSON sidecar load/save, per-GPU VRAM estimation and admission control (`vramFitsPerGPU`, `vramEstimatePerGPU`, `computePerGPUDelta`, `deviceNameToIndex`, `modelFileSizeMB`, `validateVRAMMeasurement`). |
@@ -98,6 +99,17 @@ The Chandra handler (`src/chandra_handler.go`) post-processes responses from the
 4. **Fixes Devanagari conjunct errors** — Chandra drops the `र` in certain conjuncts (कय→क्रय, केता→क्रेता, विकय→विक्रय, केती→क्रेती)
 5. **Strips page headers/footers** — blocks with `data-label="Page-Header"` or `"Page-Footer"` are omitted
 
+## Prompt-progress keepalive
+
+llama-server sends nothing on a streamed request while it processes the prompt, apart from a bare `:` SSE comment every 30 s (the first one 30 s in). On a slow model a long prompt takes minutes: `qwen-27b` and `davidau-27b` process about 185-215 tokens/s, so a 29k-token prompt is silent for about 150 s. A client that waits a fixed time for the first `data:` event gives up first. On 2026-11-18 sai-portal's 60 s first-event gate cut `davidau-27b` and then `qwen-27b` on the same 29k-token prompt, logged both as "stream wedge", and failed over to the next model each time; every failover made llama-switch evict the model it was just running.
+
+`src/promptprogress.go` fixes this in the proxy. For a streamed request on `/v1/chat/completions` or `/chat/completions` whose body does not set `return_progress`, `forward()` adds `"return_progress": true`. llama-server then sends a progress-only chunk (`delta` `{"role":"assistant","content":null}` plus a `prompt_progress` member) immediately and after each prompt batch. `streamSSE` rewrites them: the first becomes an ordinary opening chunk without `prompt_progress` (so clients see a standard data event within about a second), later ones become `: prompt progress processed=P total=T cache=C` comments (llama-server's raw values), and everything from the first token on passes through unchanged.
+
+- A client that sets `return_progress` itself gets llama-server's chunks untouched.
+- Models with raw `args` are skipped (they may not be llama-server). `server.stream_prompt_progress: false` turns the feature off.
+- Trade-off: once the opening chunk is out, a client can no longer treat the backend as silent, so a backend that hangs mid-prompt is caught only by the client's overall timeout, not by a first-event gate.
+- Non-streamed requests are unchanged: headers still arrive only when the response is complete.
+
 ## Engine: the llama-server binary
 
 The backends run **Unsloth Studio's prebuilt llama.cpp**, not a locally built
@@ -128,7 +140,7 @@ toolkit.
 
 ## Configuration reference (`config/config.yaml`)
 
-- `server`: `host`, `port`, `backend_port_start/end`, `max_models`, `idle_timeout_minutes`, `health_timeout_seconds`, `sweep_interval_seconds`.
+- `server`: `host`, `port`, `backend_port_start/end`, `max_models`, `idle_timeout_minutes`, `health_timeout_seconds`, `sweep_interval_seconds`, `stream_prompt_progress` (default true; see [Prompt-progress keepalive](#prompt-progress-keepalive)).
 - `backend`: `binary` (path to `llama-server`), `env` (notably `LD_LIBRARY_PATH` for CUDA libs), `common_args` (flags prepended to every model invocation), `workdir`, `nvidia_smi`, `ctx_checkpoints` (global default for `--ctx-checkpoints`), `cache_ram` (global default for `--cache-ram`, in MiB).
 - `models`: list of `ModelConfig`. Lookup by `id` or `name` (`FindModel` matches `id` exactly, `name` case-insensitively). Each builds its llama-server args via `ModelConfig.BuildArgs`. Supports `mmproj` (multimodal), `tensor_split`, `ctx_checkpoints`, `cache_ram`, and freeform `extra_args`. Optional per-model override fields (`binary`, `args`, `health_path`, `env`) allow running non-llama-server backends — see [Per-model runtime override](#per-model-runtime-override). Both model lists (`/v1/models`, `/models`) emit `input_modalities` via `ModelConfig.InputModalities()`: `["text","image"]` when `mmproj` is set, else `["text"]`; the optional `vision` bool overrides this (needed for raw-`args` models, whose projector llama-switch can't see). Clients such as sai-portal sync vision capability from it.
 - Path expansion: `~`, `~/...`, and `$VAR` are expanded in config values (`expand()`), including colon-separated `LD_LIBRARY_PATH`-style lists.
@@ -174,7 +186,7 @@ journalctl --user -u llama-switch -f
 - **Locking:** `BackendManager.mu` guards the `backends` map and port allocator interactions during lifecycle. Methods suffixed `Locked` require the caller to hold the lock (e.g. `startBackendLocked`, `stopLocked`, `ensureCapacityLocked`, `evictLRULocked`). Preserve the double-checked-locking pattern in `EnsureLoaded` (RLock fast path → Lock slow path).
 - **Process output** from each backend is piped through `logPipe` and printed to stdout with a `[model-id]` prefix — keep this; it's how service logs are read.
 - **Unload reasons are logged.** Every unload goes through `stopLocked(id, b, reason)`, which logs `[model-id] unloading: <reason>` (idle timeout, LRU eviction for `max_models` or VRAM with the model being admitted and free VRAM per GPU, `/models/unload` with the client address, profiling, health-check failure, shutdown). `evictLRULocked` and `StopModel` take a reason too; pass a specific one when adding a new unload path.
-- **Streaming detection** in `forward()` keys off the backend response's `Content-Type`: SSE responses (`text/event-stream`) are forwarded event-by-event via `streamSSE` (flush after each `\n\n`-delimited event); all other responses use a plain `io.Copy`.
+- **Streaming detection** in `forward()` keys off the backend response's `Content-Type`: SSE responses (`text/event-stream`) are forwarded event-by-event via `streamSSE` (flush after each `\n\n`-delimited event); all other responses use a plain `io.Copy`. `streamSSE` takes an optional `*progressRewriter` (nil = byte-for-byte passthrough).
 - **Errors during backend start** (port alloc fail, binary missing, health timeout) must release the port and clean up — mirror the cleanup in `startBackendLocked`.
 - **Config is authoritative.** `config/config.yaml` reflects a real deployment with specific GGUF paths, GPU topology, and a bind address. Treat it as live configuration, not an example template.
 - **Tests exist** in `src/` (per-model runtime override in `llama_switch_test.go`, Chandra OCR handler in `chandra_handler_test.go`, plus `http_proxy_test.go`, `inflight_test.go`, `findmodel_vram_test.go`). Run `go test ./...` to execute all tests; use `-short` to skip integration tests.

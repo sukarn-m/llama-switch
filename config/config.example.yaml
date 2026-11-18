@@ -15,6 +15,11 @@ server:
   queue_timeout_seconds: 600   # max wait in capacity queue (10 min)
   profile_drain_seconds: 60    # drain timeout before profiling
   shutdown_drain_seconds: 120  # drain timeout before stopping backends on SIGTERM
+  # Streamed chat requests ask llama-server for prompt-processing progress and
+  # forward it as an early opening chunk plus ": prompt progress ..." SSE
+  # comments, so clients with a first-event timeout (e.g. sai-portal's 60s
+  # gate) don't give up on a long prompt. Default true.
+  # stream_prompt_progress: true
 
   # ── Security ──────────────────────────────────────────────────────
   # API key required on every endpoint except /health. Clients send it as
