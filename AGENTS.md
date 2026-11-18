@@ -14,7 +14,7 @@ It is a **single-binary Go program** with no subpackages and one third-party dep
 
 ## Repository layout
 
-The repo is split into three directories plus module/docs files at the root. All Go code is one `package main` in `src/` (no subpackages or internal packages).
+The repo is split into `src/`, `config/` and `bin/`, plus a `tools/ctxtest/` test harness and module/docs files at the root. All Go code is one `package main` in `src/` (no subpackages or internal packages).
 
 | Path | Responsibility |
 |------|----------------|
@@ -33,6 +33,7 @@ The repo is split into three directories plus module/docs files at the root. All
 | `config/llama-switch.service` | systemd user unit for running `serve` as a service. |
 | `go.mod` / `go.sum` | Module `llama-switch`, Go 1.26, single dependency. Stay at repo root so the module root is the repo root. |
 | `bin/llama-switch` | Compiled binary (gitignored). Rebuild with `go build -o bin/llama-switch ./src`. |
+| `tools/ctxtest/` | Model test harness (Python/bash, not part of the Go build): launch a model from `config.yaml` with overrides, measure speed, long-context VRAM headroom and recall, run the legal quiz and perplexity. See its `README.md`. Output goes to `tools/ctxtest/work/` (gitignored). |
 
 ## Architecture & request flow
 
@@ -126,11 +127,11 @@ toolkit.
   all-reduce, and the GPU layout here is layer split, so nothing is lost.
 - **SM coverage is 75-89 only** (RTX 3090 sm_86 and RTX 2060 sm_75 both fit).
   A Hopper or Blackwell card would need a different build.
-- **The daily updater is disabled.** `llama-cpp-update.timer` (with
-  `~/scripts/llama-cpp-update.sh`) used to refresh an ai-dock CUDA 12.8 build
-  in `~/sources/llama.cpp-cuda`. That tree has been deleted, so the timer is
-  off; re-enable it only if you go back to the ai-dock build (the script
-  re-downloads it).
+- **The daily updater does not touch the production engine.**
+  `llama-cpp-update.timer` (with `~/scripts/llama-cpp-update.sh`) is enabled
+  and refreshes the *secondary* ai-dock CUDA 12.8 build in
+  `~/sources/llama.cpp-cuda` (see [Secondary engine](#secondary-engine-llamacpp-cuda-and-perplexity-testing)).
+  No backend runs it; it exists for offline tools such as `llama-perplexity`.
 - **Unsloth Studio owns that directory.** Do not edit or replace files under
   `~/.unsloth/llama.cpp/`: Unsloth Studio manages them and may replace them
   on its own updates.
@@ -138,11 +139,135 @@ toolkit.
   `--help` output was byte identical at the time of the swap), so the flags in
   `config/config.yaml` carry over unchanged.
 
+## Secondary engine: `llama.cpp-cuda` and perplexity testing
+
+`~/sources/llama.cpp-cuda` (a symlink into `~/Nextcloud/Linux/Home/sources/`)
+holds the **ai-dock CUDA 12.8 build** (`ai-dock/llama.cpp-cuda` releases,
+asset `cuda-12.8-amd64.tar.gz`). It is **not** used to serve models. It is the
+place for tools the Unsloth directory does not expose: `~/.unsloth/llama.cpp/`
+only symlinks `llama-server` and `llama-quantize`, while this tree has
+`llama-perplexity`, `llama-bench`, `llama-cli` and others. As of 2026-11-18: `v1.0.0`, build hash `2d8a3250`,
+CUDA 12.8.1, archs 75/80/86/89/90/100/120 (`VERSION.txt` in that directory).
+
+- **The updater replaces the whole directory.** `~/scripts/llama-cpp-update.sh`
+  stages a new tarball and swaps it in, so anything you add inside
+  `~/sources/llama.cpp-cuda` is lost on the next update. Keep scratch files,
+  stubs and datasets elsewhere.
+- **The launchers are tiny.** `llama-perplexity` and friends are about 14 KB
+  and load `libllama-*-impl.so` from the same directory, so
+  `LD_LIBRARY_PATH` must include that directory. The build's `RUNPATH` points
+  at a CI path (`/workspace/llama.cpp/build/bin`) that does not exist here.
+- **It does not start as-is.** `libggml-cuda.so` needs `libcudart.so.12`,
+  `libcublas.so.12`, `libcublasLt.so.12` and `libnccl.so.2`; the system only
+  has CUDA 13, and there is no NCCL anywhere. The workaround:
+  - **CUDA 12 libs from LM Studio's vendor directory:**
+    `~/.cache/lm-studio/extensions/backends/vendor/linux-llama-cuda12-vendor-v1/`
+    (`libcudart.so.12`, `libcublas.so.12`, `libcublasLt.so.12`; the files date
+    from 2025-02). Add it to `LD_LIBRARY_PATH`. This is read-only use of
+    LM Studio's cache; do not modify it.
+  - **Empty NCCL stub:** NCCL is only called for multi-GPU all-reduce, so an
+    empty library named `libnccl.so.2` is enough to satisfy the loader (the
+    8 undefined NCCL symbols are lazily bound and never called). Build it
+    outside the tree:
+    `echo 'void stub(void){}' | gcc -shared -fPIC -x c - -o libnccl.so.2 -Wl,-soname,libnccl.so.2`
+    and put its directory on `LD_LIBRARY_PATH`. **Run on one GPU
+    (`CUDA_VISIBLE_DEVICES=0`)**; do not use this build for multi-GPU tensor
+    or row split, where the stub would be called and crash.
+  - The production engine still needs none of this: `backend.env.LD_LIBRARY_PATH`
+    stays `/lib64:/usr/lib64`.
+- **Flash-attention pairs differ between builds.** The ai-dock build prints
+  `FA_QUANTS = q4_0-q4_0,q8_0-q8_0,f16-f16,bf16-bf16,f8_e4m3-f8_e4m3` in its
+  `system_info` line, so mixed K/V types are not among its compiled kernels.
+  A `q8_0` K with `q5_0` V run still completed on it at a speed in line with
+  `q8_0`/`q8_0` (about 12.7 s versus 14.0 s per 8192-token pass), so there was
+  no sign of a slow CPU fallback, but that says nothing about the Unsloth
+  engine. Confirm a mixed K/V pair on the engine that serves (load the model
+  through llama-switch and check it generates at normal speed), not only here.
+  **Confirmed on the Unsloth engine (2026-11-18):** `qwen-27b` with K `q8_0`
+  and V `q5_0` loaded and served normally through llama-switch: 53.7 t/s
+  generation on a short prompt, and 39.0 t/s generation at a 99k-token prompt
+  (525 t/s prompt processing), with DFlash drafting active. The speeds match the
+  `q8_0` figures recorded in the config comments, but there was no same-session
+  `q8_0` A/B on this engine.
+- **Perplexity results (2026-11-18).** `qwen-27b` UD-Q4_K_M, wikitext-2 test,
+  `-c 8192`, 36 chunks, K `q8_0` in every run, all on the ai-dock build:
+
+  | V cache | PPL | vs `q8_0` V |
+  |---|---|---|
+  | `q8_0` | 6.5111 ± 0.0435 | baseline |
+  | `q5_0` | 6.5140 ± 0.0435 | +0.0029 (+0.04%) |
+  | `q4_0` | 6.5344 ± 0.0437 | +0.0233 (+0.36%) |
+
+  The runs use the same text, so the differences are tighter than the ± shown,
+  which is the error of the absolute estimate. Even so, treat `q5_0` as
+  indistinguishable from `q8_0` at this context length. Long-context recall
+  was not measured.
+
+### Measuring perplexity
+
+Use this to check what a KV cache type, quant or engine change costs in
+quality. It needs a text corpus; none is kept on the machine.
+
+1. **Corpus (wikitext-2 test split, about 1.3 MB).** Download
+   `https://huggingface.co/datasets/ggml-org/ci/resolve/main/wikitext-2-raw-v1.zip`
+   (4.7 MB) into its own new empty directory and unzip it; the file you want is
+   `wikitext-2-raw/wiki.test.raw`. Treat it as untrusted data: do not run
+   anything from that directory. `~/.unsloth/llama.cpp/scripts/get-wikitext-2.sh`
+   does the same job. The 2026-11-18 run used `/var/tmp/ppl-work/data/`, which
+   is not persistent.
+2. **Free the GPU first.** Unload the loaded model with
+   `curl -X POST http://<server.host>:8080/models/unload -d '{"model":"<id>"}'`
+   (`-H 'Content-Type: application/json'`). A 27B Q4_K_M model plus the
+   desktop (about 1.2 GB on the 3090 with nothing loaded) fits on the 3090
+   alone.
+3. **Run it** (one run per setting, same model, same corpus):
+
+   ```bash
+   S=~/sources/llama.cpp-cuda
+   V=~/.cache/lm-studio/extensions/backends/vendor/linux-llama-cuda12-vendor-v1
+   LD_LIBRARY_PATH=$S:$V:<dir with libnccl.so.2 stub> CUDA_VISIBLE_DEVICES=0 \
+     $S/llama-perplexity -m <model.gguf> -f <corpus>/wiki.test.raw \
+     -ngl 99 -fa on -c 8192 -b 2048 -ub 512 -ctk q8_0 -ctv q5_0
+   ```
+
+   `-c 8192` gives 36 chunks and takes about 8 minutes per run on the 3090.
+   Vary only `-ctk`/`-ctv` between runs so the numbers are comparable.
+4. **Reading the result.** The tool prints `Final estimate: PPL = X +/- E`.
+   Compare runs on the same corpus and context; differences smaller than
+   about `E` are noise. Short Wikipedia articles do not exercise very long
+   context, so this does not test recall at 250k+ tokens; use a
+   long-context recall test for that.
+5. **Do not compare across corpora.** The PPL values quoted in the
+   `config/config.yaml` comments (for example 3.523 vs 3.531 for UD-Q4_K_XL)
+   come from a different corpus; wikitext-2 gives roughly 6 on the same
+   model. Record new results next to the setting they measure.
+   `tools/ctxtest/ppl.sh MODEL CORPUS [-ctv q8_0 ...]` wraps step 3 and
+   builds the NCCL stub in `tools/ctxtest/work/`.
+6. **Reload after the test.** llama-switch loads nothing at startup; the next
+   request loads the model again.
+
+## Testing a new model or layout (`tools/ctxtest/`)
+
+Before adding or re-tuning a model, measure it with the harness in
+`tools/ctxtest/` (details in its `README.md`). Stop llama-switch first, run
+`setup.sh` once, then:
+
+- `launch.py <model-id> [--drop flag,flag] [-- flags...]` starts a test
+  llama-server on `127.0.0.1:8300` with the same arguments llama-switch would
+  build, plus your overrides. `--print` shows the command.
+- `bench.py` for short-prompt speed and draft acceptance; `needle.py 250000 '' --image`
+  for the worst-case VRAM low point (hold GPU0 at >= 600 MiB free, aim for 1 GB)
+  and 10/50/90% recall; `quiz.py` for an Indian-law / Hindi-deed spot check
+  with an answer key; `ppl.sh` for perplexity on the ai-dock build.
+
+Restart llama-switch afterwards, and re-run `./bin/llama-switch profile` for
+any model whose config changed.
+
 ## Configuration reference (`config/config.yaml`)
 
 - `server`: `host`, `port`, `backend_port_start/end`, `max_models`, `idle_timeout_minutes`, `health_timeout_seconds`, `sweep_interval_seconds`, `stream_prompt_progress` (default true; see [Prompt-progress keepalive](#prompt-progress-keepalive)).
 - `backend`: `binary` (path to `llama-server`), `env` (notably `LD_LIBRARY_PATH` for CUDA libs), `common_args` (flags prepended to every model invocation), `workdir`, `nvidia_smi`, `ctx_checkpoints` (global default for `--ctx-checkpoints`), `cache_ram` (global default for `--cache-ram`, in MiB).
-- `models`: list of `ModelConfig`. Lookup by `id` or `name` (`FindModel` matches `id` exactly, `name` case-insensitively). Each builds its llama-server args via `ModelConfig.BuildArgs`. Supports `mmproj` (multimodal), `tensor_split`, `ctx_checkpoints`, `cache_ram`, and freeform `extra_args`. Optional per-model override fields (`binary`, `args`, `health_path`, `env`) allow running non-llama-server backends — see [Per-model runtime override](#per-model-runtime-override). Both model lists (`/v1/models`, `/models`) emit `input_modalities` via `ModelConfig.InputModalities()`: `["text","image"]` when `mmproj` is set, else `["text"]`; the optional `vision` bool overrides this (needed for raw-`args` models, whose projector llama-switch can't see). Clients such as sai-portal sync vision capability from it.
+- `models`: list of `ModelConfig`. Lookup by `id` or `name` (`FindModel` matches `id` exactly, `name` case-insensitively). Each builds its llama-server args via `ModelConfig.BuildArgs`. Supports `mmproj` (multimodal), `tensor_split`, `ctx_checkpoints`, `cache_ram`, and freeform `extra_args`. A flag set in a model's `extra_args` replaces the same flag (and its values) from `backend.common_args` rather than being passed twice (`dropOverriddenArgs`; the VRAM-cache snapshot still records the two lists separately). Optional per-model override fields (`binary`, `args`, `health_path`, `env`) allow running non-llama-server backends — see [Per-model runtime override](#per-model-runtime-override). Both model lists (`/v1/models`, `/models`) emit `input_modalities` via `ModelConfig.InputModalities()`: `["text","image"]` when `mmproj` is set, else `["text"]`; the optional `vision` bool overrides this (needed for raw-`args` models, whose projector llama-switch can't see). Clients such as sai-portal sync vision capability from it.
 - Path expansion: `~`, `~/...`, and `$VAR` are expanded in config values (`expand()`), including colon-separated `LD_LIBRARY_PATH`-style lists.
 
 **Defaults applied when fields are zero/empty:** `backend_port_start=8201`, `backend_port_end=8299`, `max_models=2`, `idle_timeout_minutes=60`, `health_timeout_seconds=180`, `sweep_interval_seconds=15`, `queue_max_depth=64`, `queue_timeout_seconds=600`, `profile_drain_seconds=60`, `shutdown_drain_seconds=120`, `nvidia_smi="nvidia-smi"`. Validation rejects `server.port` overlapping the backend port range.

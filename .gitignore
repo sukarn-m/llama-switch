@@ -10,3 +10,6 @@
 /.hermes/
 /.zcode/
 legal-eval/
+
+# ctxtest harness output (logs, corpus, quiz answers, NCCL stub)
+/tools/ctxtest/work/

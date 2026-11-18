@@ -401,15 +401,57 @@ func (m *ModelConfig) BuildArgs(common []string, port int) []string {
 	// Dynamic host/port (always loopback for backend)
 	args = append(args, "--host", "127.0.0.1", "--port", strconv.Itoa(port))
 
-	// Common args from config
-	for _, a := range common {
-		args = append(args, a)
-	}
+	// Common args from config, minus any flag the model overrides in
+	// extra_args (llama-server warns when a flag is repeated).
+	args = append(args, dropOverriddenArgs(common, m.ExtraArgs)...)
 
 	// Model-specific extra args
 	args = append(args, m.ExtraArgs...)
 
 	return args
+}
+
+// argFlagName reports whether tok is a command-line flag and returns its
+// name without any "=value" suffix. Negative numbers ("-1") are values, not
+// flags.
+func argFlagName(tok string) (string, bool) {
+	if !strings.HasPrefix(tok, "-") || len(tok) == 1 {
+		return "", false
+	}
+	if _, err := strconv.ParseFloat(tok, 64); err == nil {
+		return "", false
+	}
+	if i := strings.IndexByte(tok, '='); i > 0 {
+		tok = tok[:i]
+	}
+	return tok, true
+}
+
+// dropOverriddenArgs returns common with every flag (and its values) removed
+// that also appears in override, so a per-model extra_args flag replaces the
+// backend-level common_args one instead of being passed twice. A flag's values
+// are the tokens that follow it up to the next flag.
+func dropOverriddenArgs(common, override []string) []string {
+	overridden := map[string]bool{}
+	for _, tok := range override {
+		if name, ok := argFlagName(tok); ok {
+			overridden[name] = true
+		}
+	}
+	if len(overridden) == 0 {
+		return common
+	}
+	out := make([]string, 0, len(common))
+	skipping := false
+	for _, tok := range common {
+		if name, ok := argFlagName(tok); ok {
+			skipping = overridden[name]
+		}
+		if !skipping {
+			out = append(out, tok)
+		}
+	}
+	return out
 }
 
 // runsLlamaServer reports whether this model is served by llama-server

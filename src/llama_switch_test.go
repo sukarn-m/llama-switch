@@ -66,6 +66,44 @@ func TestBuildArgsLlamaServerMode(t *testing.T) {
 	}
 }
 
+// TestBuildArgsExtraOverridesCommon tests that a flag set in extra_args
+// replaces the same flag (and its value) from common_args rather than being
+// passed twice, while unrelated common flags are kept.
+func TestBuildArgsExtraOverridesCommon(t *testing.T) {
+	mc := &ModelConfig{
+		ID:          "m",
+		Path:        "/models/m.gguf",
+		ContextSize: 4096,
+		ExtraArgs:   []string{"--ubatch-size", "1024", "--flash-attn=off"},
+	}
+	common := []string{"--batch-size", "2048", "--ubatch-size", "512", "--flash-attn", "on", "--no-kv-unified", "--n-gpu-layers", "-1"}
+	args := mc.BuildArgs(common, 8301)
+
+	count := func(flag string) int {
+		n := 0
+		for _, a := range args {
+			if a == flag {
+				n++
+			}
+		}
+		return n
+	}
+	if n := count("--ubatch-size"); n != 1 {
+		t.Errorf("--ubatch-size passed %d times, want 1: %v", n, args)
+	}
+	if count("512") != 0 || count("1024") != 1 {
+		t.Errorf("expected only the model's ubatch value 1024: %v", args)
+	}
+	if count("--flash-attn") != 0 || count("on") != 0 {
+		t.Errorf("--flash-attn from common should be dropped when extra sets --flash-attn=off: %v", args)
+	}
+	for _, want := range []string{"--batch-size", "2048", "--no-kv-unified", "--n-gpu-layers", "-1"} {
+		if count(want) != 1 {
+			t.Errorf("expected %q kept exactly once: %v", want, args)
+		}
+	}
+}
+
 // TestBuildArgsCacheRAM tests that cache_ram is emitted as --cache-ram,
 // including the distinction between nil (omit), 0 (disable), and a
 // positive value.
