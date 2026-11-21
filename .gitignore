@@ -13,3 +13,7 @@ legal-eval/
 
 # ctxtest harness output (logs, corpus, quiz answers, NCCL stub)
 /tools/ctxtest/work/
+
+# ctxtest results: kept on this machine only (public repo; the quiz answers
+# and model notes are private)
+/tools/ctxtest/results/

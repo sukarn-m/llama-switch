@@ -1,7 +1,14 @@
 #!/usr/bin/env python3
 """Long-context stress and recall test against the running test server.
 
-  needle.py TARGET_TOKENS [extra-json] [--image]
+  needle.py TARGET_TOKENS [extra-json] [--image] [--tag NAME]
+  needle.py --fill FRACTION [extra-json] [--image] [--tag NAME]
+
+--fill sizes the prompt to FRACTION of the server's context (from /props),
+measured with the server's own tokenizer, leaving room for the image and the
+answer; use --fill 0.95 for the worst-case stress test. Results are saved to
+results/<model>/<time>-needle.json; --tag names the run in the summary
+(the suite uses "pp30k" for a ~30k-token prompt-speed run and "stress").
 
 Builds a prompt of roughly TARGET_TOKENS tokens from work/corpus.txt (Go
 source, ~3.25 chars/token), hides three facts at 10%, 50% and 90% depth,
@@ -22,7 +29,7 @@ import sys
 import time
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from _common import MinFree, chat, work_path  # noqa: E402
+from _common import MinFree, chat, props, save_result, tokenize, work_path  # noqa: E402
 
 FACTS = [
     ("// NOTE: The registration number of the sale deed is RJ-4471-B.", "RJ-4471-B"),
@@ -31,18 +38,42 @@ FACTS = [
 ]
 
 
+def take(argv, flag):
+    if flag in argv:
+        i = argv.index(flag)
+        val = argv[i + 1]
+        del argv[i:i + 2]
+        return val
+    return None
+
+
 def main():
-    args = [a for a in sys.argv[1:] if a != "--image"]
-    image = "--image" in sys.argv
-    if not args:
+    argv = sys.argv[1:]
+    image = "--image" in argv
+    argv = [a for a in argv if a != "--image"]
+    tag = take(argv, "--tag")
+    fill = take(argv, "--fill")
+    if not argv and fill is None:
         sys.exit(__doc__)
-    target = int(args[0])
-    extra = json.loads(args[1]) if len(args) > 1 and args[1] else {}
+    extra = json.loads(argv[-1]) if (argv and (fill is not None or len(argv) > 1) and argv[-1]) else {}
 
     text = open(work_path("corpus.txt"), encoding="utf-8", errors="ignore").read()
-    body_text = text[: int(target * 3.25)]
-    if len(body_text) < target * 3.25 * 0.95:
+    if fill is not None:
+        n_ctx = props()["default_generation_settings"]["n_ctx"]
+        # room for the question, the image (up to ~4k tokens) and max_tokens 2500
+        target = int(n_ctx * float(fill)) - (2500 + 300 + (4500 if image else 0))
+        sample = text[:400000]
+        cpt = len(sample) / tokenize(sample)
+    else:
+        target = int(argv[0])
+        cpt = 3.25
+    body_text = text[: int(target * cpt)]
+    if len(body_text) < target * cpt * 0.95:
         sys.exit("corpus.txt is too short for that target; rebuild it larger with setup.sh")
+    if fill is not None:
+        # tokenizer ratios drift along the corpus: trim until the real count fits
+        while (n := tokenize(body_text)) > target:
+            body_text = body_text[: int(len(body_text) * target / n * 0.995)]
     # Insert deepest first so earlier offsets stay valid.
     for frac, (line, _) in sorted(zip([0.1, 0.5, 0.9], FACTS), key=lambda x: -x[0]):
         pos = body_text.find("\n", int(len(body_text) * frac))
@@ -67,6 +98,16 @@ def main():
     print("HITS (10%/50%/90%):", [key in c for _, key in FACTS])
     print("MIN FREE during request:", mf)
     print("CONTENT tail:", c[-500:].replace("\n", " "))
+    hits = [key in c for _, key in FACTS]
+    path = save_result("needle",
+                       {"tag": tag, "target_tokens": target, "fill": float(fill) if fill else None,
+                        "image": image, "extra": extra},
+                       {"prompt_tokens": t["prompt_n"] + t.get("cache_n", 0),
+                        "pp_tps": round(t["prompt_per_second"], 1), "gen_tps": round(t["predicted_per_second"], 2),
+                        "wall_s": round(time.time() - t0), "hits": hits, "recall": f"{sum(hits)}/{len(hits)}",
+                        "min_free_mib": mf.min, "finish": r["choices"][0]["finish_reason"]},
+                       {"content_tail": c[-1500:]})
+    print("saved", path)
 
 
 if __name__ == "__main__":

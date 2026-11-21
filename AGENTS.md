@@ -33,7 +33,7 @@ The repo is split into `src/`, `config/` and `bin/`, plus a `tools/ctxtest/` tes
 | `config/llama-switch.service` | systemd user unit for running `serve` as a service. |
 | `go.mod` / `go.sum` | Module `llama-switch`, Go 1.26, single dependency. Stay at repo root so the module root is the repo root. |
 | `bin/llama-switch` | Compiled binary (gitignored). Rebuild with `go build -o bin/llama-switch ./src`. |
-| `tools/ctxtest/` | Model test harness (Python/bash, not part of the Go build): launch a model from `config.yaml` with overrides, measure speed, long-context VRAM headroom and recall, run the legal quiz and perplexity. See its `README.md`. Output goes to `tools/ctxtest/work/` (gitignored). |
+| `tools/ctxtest/` | Model test harness (Python/bash, not part of the Go build): launch a model from `config.yaml` with overrides, measure speed, long-context VRAM headroom and recall, OCR accuracy, run the legal quiz and perplexity. See its `README.md`. Scratch output goes to `tools/ctxtest/work/` (gitignored); test results go to `tools/ctxtest/results/` (also gitignored because the repo is public, but permanent: never clear it). |
 
 ## Architecture & request flow
 
@@ -116,7 +116,7 @@ llama-server sends nothing on a streamed request while it processes the prompt, 
 The backends run **Unsloth Studio's prebuilt llama.cpp**, not a locally built
 one: `~/.unsloth/llama.cpp/llama-server` (a symlink into
 `~/.unsloth/llama.cpp/build/bin/`). It is the `unslothai/llama.cpp` fork tag
-`b12347-mix-241a0f3` (upstream base `b12347`), built against the CUDA 13.3
+`b12588-mix-c0c3de8` (upstream base `b12588`, commit 883286076; updated by Unsloth Studio on 2026-11-21), built against the CUDA 13.3
 toolkit.
 
 - **Runtime deps:** only `libcudart.so.13`, `libcublas.so.13` and
@@ -135,6 +135,26 @@ toolkit.
 - **Unsloth Studio owns that directory.** Do not edit or replace files under
   `~/.unsloth/llama.cpp/`: Unsloth Studio manages them and may replace them
   on its own updates.
+- **One model uses a patched build.** `inkling-2-mini` sets `binary:` to
+  `~/sources/llama.cpp-inkling/src/build/bin/llama-server`: Unsloth's exact
+  b12588 source (release asset `llama.cpp-source-commit-883286076...tar.gz`,
+  checked against `llama-prebuilt-sha256.json`) plus a 33-line patch (`git diff`
+  in that `src/`). Stock b12588 only uses Inkling 2's banded flash-attention
+  kernel with f16/bf16 KV; with the q8_0 cache it builds a dense per-head bias
+  that grows with context × ubatch and forces `-ub 128` at 262k. The patch lets
+  the banded MMA kernel take q8_0/q5_0/q4_0 K/V (it already converts them to
+  F16 per call), which allows `-ub 512` and about 2.7× faster prompt
+  processing at long context; greedy output matches stock within run-to-run
+  noise. To rebuild (for example on a newer Unsloth release), download that
+  release's source asset, re-apply the diff, and build in the throwaway
+  distrobox `llama-build` (`docker.io/nvidia/cuda:13.3.1-devel-ubuntu22.04`):
+  `unset NVCC_CCBIN` first (the host profile sets `g++-15`, which the box lacks), then
+  `cmake -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DGGML_CUDA=ON
+  -DCMAKE_CUDA_ARCHITECTURES="75;86" -DGGML_CUDA_NCCL=OFF -DLLAMA_CURL=OFF
+  -DLLAMA_OPENSSL=OFF -DLLAMA_BUILD_TESTS=OFF
+  -DCMAKE_EXE_LINKER_FLAGS=-Wl,--allow-shlib-undefined && ninja -C build llama-server`
+  (about 15 minutes; the linker flag is needed because the box has no
+  `libcuda.so.1`). Unsloth Studio's updates do not touch this build.
 - **The CLI is flag-compatible** with the ai-dock build it replaced (the
   `--help` output was byte identical at the time of the swap), so the flags in
   `config/config.yaml` carry over unchanged.
@@ -255,10 +275,18 @@ Before adding or re-tuning a model, measure it with the harness in
 - `launch.py <model-id> [--drop flag,flag] [-- flags...]` starts a test
   llama-server on `127.0.0.1:8300` with the same arguments llama-switch would
   build, plus your overrides. `--print` shows the command.
-- `bench.py` for short-prompt speed and draft acceptance; `needle.py 250000 '' --image`
+- `bench.py` for short-prompt speed and draft acceptance; `needle.py --fill 0.95 --image`
   for the worst-case VRAM low point (hold GPU0 at >= 600 MiB free, aim for 1 GB)
-  and 10/50/90% recall; `quiz.py` for an Indian-law / Hindi-deed spot check
-  with an answer key; `ppl.sh` for perplexity on the ai-dock build.
+  and 10/50/90% recall; `ocr.py` for Hindi OCR accuracy; `quiz.py` for an
+  Indian-law / Hindi-deed spot check with an answer key; `ppl.sh` for
+  perplexity on the ai-dock build.
+- `suite.py <model-id>` runs the standard set from `suite.yaml`. Every test
+  saves a JSON result under `tools/ctxtest/results/` (the format is in the
+  harness README). Grade quiz results with `grade.py` and rebuild
+  `results/SUMMARY.md` with `report.py`. `results/` is gitignored because the
+  repository is public, but it is the permanent record: never write results
+  to `/tmp` or `work/` and never clear `results/` (the earlier quiz results
+  lived in `/tmp` or `work/` and are gone).
 
 Restart llama-switch afterwards, and re-run `./bin/llama-switch profile` for
 any model whose config changed.

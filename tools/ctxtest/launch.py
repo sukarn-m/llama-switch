@@ -33,6 +33,8 @@ import urllib.request
 import yaml
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import json  # noqa: E402
+
 from _common import PORT, REPO, URL, gpu_free, work_path  # noqa: E402
 
 
@@ -107,6 +109,44 @@ def build(cfg, mid):
     return binary, a, env, expand(be.get("workdir", "~"))
 
 
+def engine_version(binary, env):
+    try:
+        out = subprocess.run([binary, "--version"], env=env, capture_output=True, text=True, timeout=60)
+        return " | ".join(l.strip() for l in (out.stdout + out.stderr).splitlines()
+                          if l.startswith(("version", "built")))
+    except Exception as e:
+        return f"unknown ({e})"
+
+
+def write_run(o, cfg, binary, args, env, free, load_s, log):
+    """Record what is running in work/run.json; the test scripts copy it into each result."""
+    m = next(x for x in cfg["models"] if x.get("id") == o.model or str(x.get("name", "")).lower() == o.model.lower())
+    path = expand(m["path"])
+    variant = o.name if o.name and o.name != m["id"] else None
+    changed = bool(o.drop or o.overrides or o.binary)
+    if changed and not variant:
+        variant = "custom"
+    rec = {
+        "model": m["id"],
+        "variant": variant,
+        "production": not changed,
+        "overrides": {"drop": o.drop, "flags": o.overrides, "binary": o.binary},
+        "binary": binary,
+        "engine": engine_version(binary, env),
+        "args": args,
+        "gguf": os.path.basename(path),
+        "gguf_bytes": os.path.getsize(path) if os.path.exists(path) else None,
+        "mmproj": os.path.basename(expand(m["mmproj"])) if m.get("mmproj") else None,
+        "context": m.get("context_size"),
+        "idle_free_mib": free,
+        "load_seconds": round(load_s),
+        "launched": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+        "log": log,
+    }
+    with open(work_path("run.json"), "w") as f:
+        json.dump(rec, f, indent=1)
+
+
 def stop():
     out = subprocess.run(["pgrep", "-f", f"llama-server.*--port {PORT}( |$)"],
                          capture_output=True, text=True).stdout.split()
@@ -131,12 +171,16 @@ def main():
     p.add_argument("--name", help="log name (default: model id)")
     p.add_argument("--drop", action="append", default=[], metavar="FLAG",
                    help="remove FLAG (without leading dashes, comma-separated or repeated) and its values")
+    p.add_argument("--binary", help="run this llama-server instead of the configured one (e.g. for an A/B)")
     p.add_argument("--print", action="store_true", help="print the command and exit")
     p.add_argument("--stop", action="store_true", help="stop the test server and exit")
     p.add_argument("--timeout", type=int, default=300)
     o = p.parse_args(argv)
+    o.overrides = overrides
     if o.stop:
         stop()
+        if os.path.exists(work_path("run.json")):
+            os.remove(work_path("run.json"))
         return
     if not o.model:
         p.error("model id required")
@@ -149,6 +193,8 @@ def main():
         args = drop_flags(args, names)
     if overrides:
         args = drop_flags(args, {flag_name(t) for t in overrides if flag_name(t)}) + overrides
+    if o.binary:
+        binary = os.path.expanduser(o.binary)
     if o.print:
         print(binary, " ".join(f"'{x}'" if any(c in x for c in " |()[]\\*") else x for x in args))
         return
@@ -170,6 +216,7 @@ def main():
         try:
             urllib.request.urlopen(URL + "/health", timeout=2)
             free = gpu_free()
+            write_run(o, cfg, binary, args, env, free, time.time() - t0, log)
             print(f"UP after {time.time() - t0:.0f}s on {URL}; idle free: "
                   + "  ".join(f"GPU{i} {v} MiB" for i, v in enumerate(free)))
             return

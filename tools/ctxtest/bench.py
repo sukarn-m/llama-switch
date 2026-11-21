@@ -6,7 +6,7 @@
 Sends three prompts (code, legal English, Hindi translation) with thinking
 off and max_tokens 600, `runs` times each (default 3), after one warm-up.
 Prints the mean generation t/s, each sample, and the speculative draft
-acceptance rate. Single samples vary by +-8 t/s with drafting on, so compare
+acceptance rate, and saves them to results/<model>/<time>-bench.json. Single samples vary by +-8 t/s with drafting on, so compare
 means over at least 2-3 runs. extra-json is merged into every request body,
 e.g. '{"temperature":0.7}'.
 """
@@ -15,7 +15,7 @@ import os
 import sys
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from _common import chat  # noqa: E402
+from _common import chat, save_result  # noqa: E402
 
 PROMPTS = [
     "Write a Python function that parses an ISO 8601 date string without using datetime, with tests.",
@@ -44,6 +44,11 @@ def main():
             accepted += t.get("draft_n_accepted", 0)
     acc = f"{accepted / drafted:.2f}" if drafted else "n/a"
     print(f"gen avg {sum(tps) / len(tps):.1f} t/s  samples {[round(x, 1) for x in tps]}  draft accept {acc}")
+    path = save_result("bench", {"runs": runs, "prompts": len(PROMPTS), "max_tokens": 600, "extra": extra},
+                       {"gen_tps_mean": round(sum(tps) / len(tps), 2), "gen_tps_samples": [round(x, 2) for x in tps],
+                        "draft_n": drafted, "draft_accepted": accepted,
+                        "draft_accept_rate": round(accepted / drafted, 3) if drafted else None})
+    print("saved", path)
 
 
 if __name__ == "__main__":

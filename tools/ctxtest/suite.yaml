@@ -1,0 +1,36 @@
+# Standard test suite per model (run with suite.py). Every model gets the
+# default tests unless it lists its own; "extra" is merged into the request
+# body of that test (same as the scripts' extra-json argument).
+#
+#   bench    short-prompt generation speed and draft acceptance (3 runs)
+#   pp30k    needle.py with a ~30k-token prompt: prompt speed at moderate depth
+#   stress   needle.py --fill 0.95 --image: worst-case VRAM low point and recall
+#   ocr      ocr.py: Hindi deed page transcription, CER and key fields
+#   quiz     quiz.py, 2 samples per question, thinking on (grade with grade.py)
+defaults:
+  tests: [bench, pp30k, stress, ocr, quiz]
+
+models:
+  ornith-35b: {}
+  qwen36-35b: {}
+  qwen-27b: {}
+  davidau-27b: {}
+  muse-glimmer-30b:
+    # Harmony template: reasoning depth is a template kwarg; keep the speed,
+    # stress and OCR runs short, let the quiz use the template default (high).
+    extra:
+      bench: {chat_template_kwargs: {reasoning_strength: low}}
+      pp30k: {chat_template_kwargs: {reasoning_strength: low}}
+      stress: {chat_template_kwargs: {reasoning_strength: low}}
+      ocr: {chat_template_kwargs: {reasoning_strength: low}}
+  inkling-2-mini:
+    # Template kwarg reasoning_effort (none/minimal/low/medium/high/xhigh/max,
+    # default 0.9 = high). At high, the OCR run spent its 3000 tokens thinking
+    # and never answered (2026-11-21), so the short runs use low, as for Muse.
+    extra:
+      bench: {chat_template_kwargs: {reasoning_effort: low}}
+      pp30k: {chat_template_kwargs: {reasoning_effort: low}}
+      stress: {chat_template_kwargs: {reasoning_effort: low}}
+      ocr: {chat_template_kwargs: {reasoning_effort: low}}
+  chandra-ocr:
+    tests: [ocr]
